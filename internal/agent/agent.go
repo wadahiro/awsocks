@@ -144,7 +144,7 @@ func (a *Agent) handleConnectDirect(msg *protocol.Message) error {
 }
 
 func (a *Agent) dialAndConnect(connID uint32, network, address string, directMode bool) {
-	a.logInfo("dialAndConnect connID=%d address=%s directMode=%v hasBackend=%v", connID, address, directMode, a.backend != nil)
+	a.logDebug("dialAndConnect connID=%d address=%s directMode=%v hasBackend=%v", connID, address, directMode, a.backend != nil)
 
 	// Dial the target
 	// Use longer timeout to allow for SSM connection establishment (can take 30-60s)
@@ -155,16 +155,16 @@ func (a *Agent) dialAndConnect(connID uint32, network, address string, directMod
 	var err error
 	if directMode {
 		// Direct connection via VM's NAT (bypass EC2 backend)
-		a.logInfo("Using direct connection (VM NAT)")
+		a.logDebug("Using direct connection (VM NAT)")
 		var d net.Dialer
 		conn, err = d.DialContext(ctx, network, address)
 	} else if a.backend != nil {
 		// Use backend for connection (via EC2)
-		a.logInfo("Using backend for connection")
+		a.logDebug("Using backend for connection")
 		conn, err = a.backend.Dial(ctx, network, address)
 	} else {
 		// No backend configured, fall back to direct connection
-		a.logInfo("No backend, falling back to direct connection")
+		a.logDebug("No backend, falling back to direct connection")
 		var d net.Dialer
 		conn, err = d.DialContext(ctx, network, address)
 	}

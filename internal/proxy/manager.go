@@ -44,7 +44,8 @@ type Config struct {
 	AutoStop  bool // --auto-stop
 
 	// Routing settings
-	RoutingConfigPath string // --routing-config
+	RoutingConfigPath string           // --routing-config (deprecated, use RoutingConfig)
+	RoutingConfig     *routing.Config  // Direct routing config (takes precedence over RoutingConfigPath)
 
 	// Lazy connection settings
 	LazyConnect bool // --lazy
@@ -161,7 +162,11 @@ func (m *VMManager) Start(ctx context.Context) error {
 
 	// Initialize router for VM mode (with vm-direct support)
 	var router routing.Router
-	if m.cfg.RoutingConfigPath != "" {
+	if m.cfg.RoutingConfig != nil {
+		// Direct routing config takes precedence
+		router = routing.NewRouter(m.cfg.RoutingConfig, routing.WithVMMode())
+		logger.Info("Routing config loaded", "default", m.cfg.RoutingConfig.Default)
+	} else if m.cfg.RoutingConfigPath != "" {
 		cfg, err := routing.LoadConfig(m.cfg.RoutingConfigPath)
 		if err != nil {
 			return fmt.Errorf("failed to load routing config: %w", err)
@@ -428,7 +433,11 @@ func (m *DirectManager) Start(ctx context.Context) error {
 
 	// Initialize router
 	var router routing.Router
-	if m.cfg.RoutingConfigPath != "" {
+	if m.cfg.RoutingConfig != nil {
+		// Direct routing config takes precedence
+		router = routing.NewRouter(m.cfg.RoutingConfig)
+		logger.Info("Routing config loaded", "default", m.cfg.RoutingConfig.Default)
+	} else if m.cfg.RoutingConfigPath != "" {
 		cfg, err := routing.LoadConfig(m.cfg.RoutingConfigPath)
 		if err != nil {
 			return fmt.Errorf("failed to load routing config: %w", err)

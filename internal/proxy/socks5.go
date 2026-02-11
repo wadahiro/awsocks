@@ -45,7 +45,10 @@ func isClientDisconnectError(msg string) bool {
 	// These errors occur when client closes connection before proxy finishes
 	return strings.Contains(msg, "broken pipe") ||
 		strings.Contains(msg, "connection reset by peer") ||
-		strings.Contains(msg, "use of closed network connection")
+		strings.Contains(msg, "use of closed network connection") ||
+		strings.Contains(msg, "read timeout") ||
+		strings.Contains(msg, "write timeout") ||
+		strings.Contains(msg, "i/o timeout")
 }
 
 // connResult holds the result of a connection attempt
