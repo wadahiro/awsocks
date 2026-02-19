@@ -30,6 +30,9 @@ func (w *slogWriter) Write(p []byte) (n int, err error) {
 		// Downgrade client disconnect errors to DEBUG (normal behavior)
 		if isClientDisconnectError(msg) {
 			proxyLogger.Debug(msg)
+		} else if isDialError(msg) {
+			// Dial failures are already logged with route info in dial()
+			proxyLogger.Debug(msg)
 		} else {
 			proxyLogger.Error(msg)
 		}
@@ -48,6 +51,11 @@ func isClientDisconnectError(msg string) bool {
 		strings.Contains(msg, "read timeout") ||
 		strings.Contains(msg, "write timeout") ||
 		strings.Contains(msg, "i/o timeout")
+}
+
+// isDialError checks if the error is a dial failure (already logged with route info)
+func isDialError(msg string) bool {
+	return strings.Contains(msg, "Connect to") && strings.Contains(msg, "failed:")
 }
 
 // LazyInitializer is an interface for triggering lazy initialization
@@ -202,12 +210,20 @@ func (s *SOCKS5Server) dial(ctx context.Context, network, addr string) (net.Conn
 	// For direct route, connect directly (no need to wait for initialization)
 	if route == routing.RouteDirect {
 		var dialer net.Dialer
-		return dialer.DialContext(ctx, network, addr)
+		conn, err := dialer.DialContext(ctx, network, addr)
+		if err != nil {
+			proxyLogger.Warn("Dial failed", "route", route, "address", addr, "error", err)
+		}
+		return conn, err
 	}
 
 	// For vm-direct route, go through agent (no need to wait for proxy initialization)
 	if route == routing.RouteVMDirect {
-		return s.dialViaAgent(ctx, network, addr)
+		conn, err := s.dialViaAgent(ctx, network, addr)
+		if err != nil {
+			proxyLogger.Warn("Dial failed", "route", route, "address", addr, "error", err)
+		}
+		return conn, err
 	}
 
 	// RouteProxy: check if lazy initialization is needed
@@ -239,6 +255,7 @@ func (s *SOCKS5Server) dial(ctx context.Context, network, addr string) (net.Conn
 
 	// Check if fallback is needed
 	if !routing.IsFallbackableError(err) {
+		proxyLogger.Warn("Dial failed", "route", route, "address", addr, "error", err)
 		return nil, err
 	}
 
@@ -252,7 +269,9 @@ func (s *SOCKS5Server) dial(ctx context.Context, network, addr string) (net.Conn
 		"address", addr, "from", route, "to", fallbackRoute, "reason", err)
 
 	fallbackConn, fallbackErr := s.dialWithRoute(ctx, network, addr, fallbackRoute)
-	if fallbackErr == nil && fallbackRoute == routing.RouteProxy && s.idleTracker != nil {
+	if fallbackErr != nil {
+		proxyLogger.Warn("Fallback dial failed", "route", fallbackRoute, "address", addr, "error", fallbackErr)
+	} else if fallbackRoute == routing.RouteProxy && s.idleTracker != nil {
 		s.idleTracker.Touch()
 	}
 	return fallbackConn, fallbackErr

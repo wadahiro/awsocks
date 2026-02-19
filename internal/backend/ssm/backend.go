@@ -429,7 +429,7 @@ func (b *Backend) connect() {
 			return
 		}
 
-		b.logWarn("SSM connection attempt %d failed: %v", attempt, err)
+		b.logInfo("SSM connection attempt %d failed: %v", attempt, err)
 		if attempt < maxRetries {
 			time.Sleep(retryInterval)
 		}
