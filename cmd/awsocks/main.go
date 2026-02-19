@@ -58,13 +58,6 @@ func main() {
 						Aliases: []string{"c"},
 						Usage:   "Path to config file",
 					},
-					// Execution mode (deprecated)
-					&cli.StringFlag{
-						Name:    "mode",
-						Aliases: []string{"m"},
-						Usage:   "Deprecated: use --aws-api-route instead",
-						Hidden:  true,
-					},
 					&cli.StringFlag{
 						Name:  "aws-api-route",
 						Usage: "AWS API route: direct (default) or vm",
@@ -155,13 +148,7 @@ func main() {
 						Name:  "route-vm-direct",
 						Usage: "Patterns to route via VM NAT (can be specified multiple times)",
 					},
-					// Deprecated
-					&cli.StringFlag{
-						Name:   "routing-config",
-						Usage:  "Path to routing config file (deprecated: use config file instead)",
-						Hidden: true,
 					},
-				},
 				Action: startAction,
 			},
 		},
@@ -219,11 +206,6 @@ func startAction(c *cli.Context) error {
 
 	// Merge configurations: CLI > profile > defaults > built-in
 	merged := appconfig.Merge(&appCfg.Defaults, profile, cli)
-
-	// Deprecation warning for --mode
-	if merged.Mode == "vm" && merged.AWSAPIRoute == "vm" {
-		fmt.Println("Warning: --mode is deprecated. Use --aws-api-route instead.")
-	}
 
 	// Auto-detect SSH key if not specified
 	if merged.SSHKey == "" && (merged.InstanceID != "" || merged.Name != "") {
@@ -374,10 +356,6 @@ func buildCLIFlags(c *cli.Context) *appconfig.CLIFlags {
 	if c.IsSet("auto-stop") {
 		cli.AutoStop = c.Bool("auto-stop")
 		cli.AutoStopIsSet = true
-	}
-	if c.IsSet("mode") {
-		// Backward compatibility: --mode vm maps to --aws-api-route vm
-		cli.Mode = c.String("mode")
 	}
 	if c.IsSet("aws-api-route") {
 		cli.AWSAPIRoute = c.String("aws-api-route")

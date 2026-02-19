@@ -25,7 +25,6 @@ type CLIFlags struct {
 	AutoStopIsSet  bool
 
 	// Proxy settings
-	Mode        string // Deprecated: use AWSAPIRoute instead
 	AWSAPIRoute string // "direct" or "vm"
 	Listen      string
 	RemotePort  int
@@ -51,7 +50,6 @@ type MergedConfig struct {
 	AutoStart        bool
 	AutoStop         bool
 	IdleTimeout      time.Duration
-	Mode             string // Deprecated: use AWSAPIRoute instead
 	AWSAPIRoute      string // "direct" (default) or "vm"
 	Listen           string
 	RemotePort       int
@@ -63,7 +61,6 @@ type MergedConfig struct {
 var builtInDefaults = Defaults{
 	SSHUser:    "ec2-user",
 	Listen:     "127.0.0.1:1080",
-	Mode:       "direct",
 	RemotePort: 22,
 	Lazy:       boolPtr(true),
 }
@@ -79,7 +76,6 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		// Start with built-in defaults
 		SSHUser:    builtInDefaults.SSHUser,
 		Listen:     builtInDefaults.Listen,
-		Mode:       builtInDefaults.Mode,
 		RemotePort: builtInDefaults.RemotePort,
 		Lazy:       true, // Default lazy to true
 		Routing:    &RoutingConfig{},
@@ -92,9 +88,6 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		}
 		if defaults.Listen != "" {
 			result.Listen = defaults.Listen
-		}
-		if defaults.Mode != "" {
-			result.Mode = defaults.Mode
 		}
 		if defaults.AWSAPIRoute != "" {
 			result.AWSAPIRoute = defaults.AWSAPIRoute
@@ -143,9 +136,6 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		}
 		if profile.AutoStop {
 			result.AutoStop = true
-		}
-		if profile.Mode != "" {
-			result.Mode = profile.Mode
 		}
 		if profile.AWSAPIRoute != "" {
 			result.AWSAPIRoute = profile.AWSAPIRoute
@@ -201,9 +191,6 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		if cli.AutoStopIsSet {
 			result.AutoStop = cli.AutoStop
 		}
-		if cli.Mode != "" {
-			result.Mode = cli.Mode
-		}
 		if cli.AWSAPIRoute != "" {
 			result.AWSAPIRoute = cli.AWSAPIRoute
 		}
@@ -219,11 +206,6 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 
 		// Apply CLI routing settings
 		result.Routing = mergeRoutingFromCLI(result.Routing, cli)
-	}
-
-	// Backward compatibility: migrate Mode to AWSAPIRoute if not explicitly set
-	if result.AWSAPIRoute == "" && result.Mode == "vm" {
-		result.AWSAPIRoute = "vm"
 	}
 
 	return result

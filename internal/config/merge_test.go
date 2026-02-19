@@ -68,7 +68,6 @@ func TestMerge_DefaultsApplied(t *testing.T) {
 	defaults := &Defaults{
 		SSHUser:    "ec2-user",
 		Listen:     "127.0.0.1:1080",
-		Mode:       "direct",
 		RemotePort: 22,
 		Lazy:       boolPtr(true),
 	}
@@ -81,7 +80,6 @@ func TestMerge_DefaultsApplied(t *testing.T) {
 
 	assert.Equal(t, "ec2-user", result.SSHUser)
 	assert.Equal(t, "127.0.0.1:1080", result.Listen)
-	assert.Equal(t, "direct", result.Mode)
 	assert.Equal(t, 22, result.RemotePort)
 	assert.True(t, result.Lazy)
 }
@@ -92,7 +90,6 @@ func TestMerge_BuiltInDefaults(t *testing.T) {
 
 	assert.Equal(t, "ec2-user", result.SSHUser)
 	assert.Equal(t, "127.0.0.1:1080", result.Listen)
-	assert.Equal(t, "direct", result.Mode)
 	assert.Equal(t, 22, result.RemotePort)
 	assert.True(t, result.Lazy)
 }
@@ -324,7 +321,6 @@ func TestMerge_AWSAPIRoute(t *testing.T) {
 		defaultsRoute    string
 		profileRoute     string
 		cliRoute         string
-		mode             string
 		expectedRoute    string
 	}{
 		{
@@ -348,24 +344,13 @@ func TestMerge_AWSAPIRoute(t *testing.T) {
 			name:          "empty by default",
 			expectedRoute: "",
 		},
-		{
-			name:          "mode=vm migrated to aws-api-route=vm",
-			mode:          "vm",
-			expectedRoute: "vm",
-		},
-		{
-			name:          "explicit aws-api-route takes precedence over mode migration",
-			mode:          "vm",
-			cliRoute:      "direct",
-			expectedRoute: "direct",
-		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			defaults := &Defaults{AWSAPIRoute: tt.defaultsRoute}
 			profile := &Profile{AWSAPIRoute: tt.profileRoute}
-			cli := &CLIFlags{AWSAPIRoute: tt.cliRoute, Mode: tt.mode}
+			cli := &CLIFlags{AWSAPIRoute: tt.cliRoute}
 
 			result := Merge(defaults, profile, cli)
 			assert.Equal(t, tt.expectedRoute, result.AWSAPIRoute)

@@ -40,8 +40,7 @@ type Config struct {
 	AutoStop  bool // --auto-stop
 
 	// Routing settings
-	RoutingConfigPath string          // --routing-config (deprecated, use RoutingConfig)
-	RoutingConfig     *routing.Config // Direct routing config (takes precedence over RoutingConfigPath)
+	RoutingConfig *routing.Config
 
 	// Lazy connection settings
 	LazyConnect bool // --lazy
@@ -202,17 +201,6 @@ func (m *Manager) createRouter() routing.Router {
 	if m.cfg.RoutingConfig != nil {
 		router := routing.NewRouter(m.cfg.RoutingConfig, opts...)
 		logger.Info("Routing config loaded", "default", m.cfg.RoutingConfig.Default)
-		return router
-	}
-
-	if m.cfg.RoutingConfigPath != "" {
-		cfg, err := routing.LoadConfig(m.cfg.RoutingConfigPath)
-		if err != nil {
-			logger.Warn("Failed to load routing config, using defaults", "error", err)
-			return routing.NewDefaultRouter(opts...)
-		}
-		router := routing.NewRouter(cfg, opts...)
-		logger.Info("Routing config loaded", "path", m.cfg.RoutingConfigPath, "default", cfg.Default)
 		return router
 	}
 
