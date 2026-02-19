@@ -60,6 +60,8 @@ type connResult struct {
 // LazyInitializer is an interface for triggering lazy initialization
 type LazyInitializer interface {
 	EnsureInitialized(ctx context.Context) error
+	InitDone() <-chan struct{} // closed when initialization completes (success or failure)
+	InitError() error          // returns error if initialization failed
 }
 
 // SOCKS5Server provides a SOCKS5 proxy that forwards connections via vsock to VM agent
@@ -162,10 +164,25 @@ func (s *SOCKS5Server) dialViaAgent(ctx context.Context, network, addr string) (
 		// Start initialization in background (non-blocking)
 		go s.lazyInitializer.EnsureInitialized(context.Background())
 
-		// During initialization, use vm-direct to avoid blocking
-		// This allows OIDC auth flow and other requests to proceed
-		proxyLogger.Debug("Initialization in progress, using vm-direct", "address", addr)
-		return s.dialWithRoute(ctx, network, addr, routing.RouteVMDirect)
+		if route == routing.RouteProxy {
+			// Hold proxy connections until initialization completes
+			proxyLogger.Info("Waiting for initialization to complete", "address", addr)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-s.lazyInitializer.InitDone():
+				if err := s.lazyInitializer.InitError(); err != nil {
+					return nil, fmt.Errorf("initialization failed: %w", err)
+				}
+				proxyLogger.Info("Initialization complete, dialing via proxy", "address", addr)
+				// Fall through to normal proxy dial below
+			}
+		} else {
+			// RouteVMDirect: use vm-direct immediately to avoid blocking
+			// This allows OIDC auth flow and other requests to proceed
+			proxyLogger.Debug("Initialization in progress, using vm-direct", "address", addr)
+			return s.dialWithRoute(ctx, network, addr, routing.RouteVMDirect)
+		}
 	}
 
 	// Try primary route
@@ -196,13 +213,12 @@ func (s *SOCKS5Server) isInitialized() bool {
 	if s.lazyInitializer == nil {
 		return true
 	}
-	// Check if VMManager is initialized
-	if vmMgr, ok := s.lazyInitializer.(*VMManager); ok {
-		vmMgr.awsInitMu.Lock()
-		defer vmMgr.awsInitMu.Unlock()
-		return vmMgr.awsInitialized
+	select {
+	case <-s.lazyInitializer.InitDone():
+		return true
+	default:
+		return false
 	}
-	return true
 }
 
 // dialWithRoute attempts to dial using the specified route

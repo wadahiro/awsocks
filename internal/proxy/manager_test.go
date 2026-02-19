@@ -2,12 +2,14 @@ package proxy
 
 import (
 	"context"
+	"fmt"
 	"net"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/wadahiro/awsocks/internal/routing"
 )
 
 func TestDirectSOCKS5Server_StopClosesListener(t *testing.T) {
@@ -209,4 +211,214 @@ func TestDirectSOCKS5Server_FallsBackToDirectWhenNoBackend(t *testing.T) {
 
 	conn.Close()
 	server.Stop()
+}
+
+// mockLazyInitForDirect implements LazyInitializer for direct mode testing
+type mockLazyInitForDirect struct {
+	initDone chan struct{}
+	initErr  error
+}
+
+func newMockLazyInitForDirect() *mockLazyInitForDirect {
+	return &mockLazyInitForDirect{
+		initDone: make(chan struct{}),
+	}
+}
+
+func (m *mockLazyInitForDirect) EnsureInitialized(ctx context.Context) error {
+	return m.initErr
+}
+
+func (m *mockLazyInitForDirect) InitDone() <-chan struct{} {
+	return m.initDone
+}
+
+func (m *mockLazyInitForDirect) InitError() error {
+	return m.initErr
+}
+
+func (m *mockLazyInitForDirect) completeInit() {
+	close(m.initDone)
+}
+
+func (m *mockLazyInitForDirect) failInit(err error) {
+	m.initErr = err
+	close(m.initDone)
+}
+
+func TestDirectDialer_RouteProxy_WaitsForInit(t *testing.T) {
+	// Start a dummy TCP server as backend target
+	dummyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer dummyListener.Close()
+
+	dummyAddr := dummyListener.Addr().String()
+	go func() {
+		for {
+			conn, err := dummyListener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	cfg := &Config{ListenAddr: "127.0.0.1:0"}
+	router := &mockRouter{route: routing.RouteProxy}
+	server := NewDirectSOCKS5Server(cfg, nil, router)
+
+	mock := newMockLazyInitForDirect()
+	server.SetLazyInitializer(mock)
+
+	// Set backend dialer that connects to dummy server
+	server.SetBackendDialer(&mockBackendForTest{
+		dialFunc: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			return net.Dial(network, dummyAddr)
+		},
+	})
+
+	dialer := &directDialer{cfg: cfg, server: server, router: router}
+
+	// Dial should block until init completes
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := dialer.Dial(context.Background(), "tcp", "internal.example.com:443")
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+
+	// Verify it's still waiting
+	select {
+	case <-resultCh:
+		t.Fatal("Dial should not return before init completes")
+	case <-time.After(100 * time.Millisecond):
+		// Expected: still waiting
+	}
+
+	// Complete initialization
+	mock.completeInit()
+
+	// Now it should complete
+	select {
+	case result := <-resultCh:
+		require.NoError(t, result.err)
+		assert.NotNil(t, result.conn)
+		if result.conn != nil {
+			result.conn.Close()
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Dial did not return after init completed")
+	}
+}
+
+func TestDirectDialer_RouteProxy_InitFailure(t *testing.T) {
+	cfg := &Config{ListenAddr: "127.0.0.1:0"}
+	router := &mockRouter{route: routing.RouteProxy}
+	server := NewDirectSOCKS5Server(cfg, nil, router)
+
+	mock := newMockLazyInitForDirect()
+	server.SetLazyInitializer(mock)
+
+	dialer := &directDialer{cfg: cfg, server: server, router: router}
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := dialer.Dial(context.Background(), "tcp", "internal.example.com:443")
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+
+	// Wait for Dial goroutine to reach the select{} wait
+	time.Sleep(100 * time.Millisecond)
+
+	// Fail initialization
+	mock.failInit(fmt.Errorf("AWS credentials expired"))
+
+	select {
+	case result := <-resultCh:
+		assert.Nil(t, result.conn)
+		require.Error(t, result.err)
+		assert.Contains(t, result.err.Error(), "initialization failed")
+		assert.Contains(t, result.err.Error(), "AWS credentials expired")
+	case <-time.After(2 * time.Second):
+		t.Fatal("Dial did not return after init failed")
+	}
+}
+
+func TestDirectDialer_RouteDirect_NoWait(t *testing.T) {
+	// Start a dummy TCP server for direct connection
+	dummyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer dummyListener.Close()
+
+	dummyAddr := dummyListener.Addr().String()
+	go func() {
+		for {
+			conn, err := dummyListener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	cfg := &Config{ListenAddr: "127.0.0.1:0"}
+	router := &mockRouter{route: routing.RouteDirect}
+	server := NewDirectSOCKS5Server(cfg, nil, router)
+
+	mock := newMockLazyInitForDirect()
+	server.SetLazyInitializer(mock)
+	// Note: initDone is NOT closed, so init is still "in progress"
+
+	dialer := &directDialer{cfg: cfg, server: server, router: router}
+
+	// RouteDirect should return immediately, not wait for init
+	conn, err := dialer.Dial(context.Background(), "tcp", dummyAddr)
+	require.NoError(t, err)
+	assert.NotNil(t, conn)
+	if conn != nil {
+		conn.Close()
+	}
+}
+
+func TestDirectDialer_RouteProxy_ContextCancel(t *testing.T) {
+	cfg := &Config{ListenAddr: "127.0.0.1:0"}
+	router := &mockRouter{route: routing.RouteProxy}
+	server := NewDirectSOCKS5Server(cfg, nil, router)
+
+	mock := newMockLazyInitForDirect()
+	server.SetLazyInitializer(mock)
+
+	dialer := &directDialer{cfg: cfg, server: server, router: router}
+
+	ctx, cancel := context.WithCancel(context.Background())
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := dialer.Dial(ctx, "tcp", "internal.example.com:443")
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+
+	// Cancel context while waiting for init
+	time.Sleep(50 * time.Millisecond)
+	cancel()
+
+	select {
+	case result := <-resultCh:
+		assert.Nil(t, result.conn)
+		require.Error(t, result.err)
+		assert.ErrorIs(t, result.err, context.Canceled)
+	case <-time.After(2 * time.Second):
+		t.Fatal("Dial did not return after context cancellation")
+	}
 }

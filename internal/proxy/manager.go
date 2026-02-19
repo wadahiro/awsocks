@@ -89,6 +89,8 @@ type VMManager struct {
 	// Lazy initialization state
 	awsInitialized bool
 	awsInitMu      sync.Mutex
+	initDone       chan struct{} // closed when initialization completes
+	initErr        error        // stores initialization error
 }
 
 var logger = log.For(log.ComponentManager)
@@ -101,6 +103,7 @@ func NewVMManager(cfg *Config) (*VMManager, error) {
 		credProv: credentials.NewProvider(cfg.Profile, cfg.Region),
 		ctx:      ctx,
 		cancel:   cancel,
+		initDone: make(chan struct{}),
 	}, nil
 }
 
@@ -113,6 +116,7 @@ func (m *VMManager) Start(ctx context.Context) error {
 		if err := m.initializeAWS(ctx); err != nil {
 			return err
 		}
+		close(m.initDone)
 	} else {
 		// Lazy mode: store instance ID if provided directly (not via name)
 		m.resolvedInstanceID = m.cfg.InstanceID
@@ -247,26 +251,43 @@ func (m *VMManager) EnsureInitialized(ctx context.Context) error {
 
 	// 1. Initialize AWS (credential provider, config, instance resolution)
 	if err := m.initializeAWS(ctx); err != nil {
+		m.initErr = err
+		close(m.initDone)
 		return err
 	}
 
 	// 2. Re-send BackendConfig with resolved instance ID
 	if err := m.sendBackendConfig(); err != nil {
-		return fmt.Errorf("failed to send backend config: %w", err)
+		m.initErr = fmt.Errorf("failed to send backend config: %w", err)
+		close(m.initDone)
+		return m.initErr
 	}
 
 	// 3. Send credentials to agent
 	if err := m.sendCredentials(ctx); err != nil {
-		return fmt.Errorf("failed to send credentials: %w", err)
+		m.initErr = fmt.Errorf("failed to send credentials: %w", err)
+		close(m.initDone)
+		return m.initErr
 	}
 
 	// 4. Start credential refresh loop
 	go m.credentialRefreshLoop(m.ctx)
 
 	m.awsInitialized = true
+	close(m.initDone)
 	logger.Info("Lazy initialization completed")
 
 	return nil
+}
+
+// InitDone returns a channel that is closed when initialization completes (success or failure)
+func (m *VMManager) InitDone() <-chan struct{} {
+	return m.initDone
+}
+
+// InitError returns the initialization error, if any
+func (m *VMManager) InitError() error {
+	return m.initErr
 }
 
 // Stop stops the VM-based proxy
@@ -403,6 +424,8 @@ type DirectManager struct {
 	// Lazy initialization state
 	awsInitialized bool
 	awsInitMu      sync.Mutex
+	initDone       chan struct{} // closed when initialization completes
+	initErr        error        // stores initialization error
 }
 
 // NewDirectManager creates a new direct proxy manager
@@ -413,6 +436,7 @@ func NewDirectManager(cfg *Config) (*DirectManager, error) {
 		credProv: credentials.NewProvider(cfg.Profile, cfg.Region),
 		ctx:      ctx,
 		cancel:   cancel,
+		initDone: make(chan struct{}),
 	}, nil
 }
 
@@ -425,6 +449,7 @@ func (m *DirectManager) Start(ctx context.Context) error {
 		if err := m.initializeAWS(ctx); err != nil {
 			return err
 		}
+		close(m.initDone)
 	} else {
 		// Lazy mode: store instance ID if provided directly (not via name)
 		m.resolvedInstanceID = m.cfg.InstanceID
@@ -571,6 +596,8 @@ func (m *DirectManager) EnsureInitialized(ctx context.Context) error {
 	logger.Info("Lazy initialization: starting AWS credential and instance resolution...")
 
 	if err := m.initializeAWS(ctx); err != nil {
+		m.initErr = err
+		close(m.initDone)
 		return err
 	}
 
@@ -580,9 +607,20 @@ func (m *DirectManager) EnsureInitialized(ctx context.Context) error {
 	}
 
 	m.awsInitialized = true
+	close(m.initDone)
 	logger.Info("Lazy initialization completed")
 
 	return nil
+}
+
+// InitDone returns a channel that is closed when initialization completes (success or failure)
+func (m *DirectManager) InitDone() <-chan struct{} {
+	return m.initDone
+}
+
+// InitError returns the initialization error, if any
+func (m *DirectManager) InitError() error {
+	return m.initErr
 }
 
 // GetBackend returns the current backend (may be nil if not initialized)
@@ -741,11 +779,15 @@ func (s *DirectSOCKS5Server) GetDialer() Dialer {
 
 // IsInitialized returns true if lazy initialization is complete
 func (s *DirectSOCKS5Server) IsInitialized() bool {
-	s.backendMu.RLock()
-	defer s.backendMu.RUnlock()
-	// If there's a backend, initialization is complete
-	// If there's no lazy initializer, we're already initialized
-	return s.backend != nil || s.lazyInitializer == nil
+	if s.lazyInitializer == nil {
+		return true
+	}
+	select {
+	case <-s.lazyInitializer.InitDone():
+		return true
+	default:
+		return false
+	}
 }
 
 // Start starts the direct SOCKS5 server
@@ -811,28 +853,42 @@ func (d *directDialer) Dial(ctx context.Context, network, addr string) (net.Conn
 		host = addr
 	}
 
-	// Check if lazy initialization is in progress or not yet started
-	// If so, use direct connection to avoid blocking (e.g., OIDC auth flow)
-	if d.server.lazyInitializer != nil && !d.server.IsInitialized() {
-		// Try non-blocking initialization (will start if not already running)
-		go d.server.lazyInitializer.EnsureInitialized(context.Background())
-
-		// Use direct connection while initializing
-		logger.Debug("Initialization in progress, using direct connection", "address", addr)
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, network, addr)
-	}
-
-	// Determine route
+	// Determine route first (needed for lazy init decision)
 	route := routing.RouteProxy
 	if d.router != nil {
 		route = d.router.Route(host)
 	}
 
-	// For direct route, connect directly
+	// For direct route, connect directly (no need to wait for initialization)
 	if route == routing.RouteDirect {
 		var dialer net.Dialer
 		return dialer.DialContext(ctx, network, addr)
+	}
+
+	// Check if lazy initialization is in progress or not yet started
+	if d.server.lazyInitializer != nil && !d.server.IsInitialized() {
+		// Try non-blocking initialization (will start if not already running)
+		go d.server.lazyInitializer.EnsureInitialized(context.Background())
+
+		if route == routing.RouteProxy {
+			// Hold proxy connections until initialization completes
+			logger.Info("Waiting for initialization to complete", "address", addr)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-d.server.lazyInitializer.InitDone():
+				if err := d.server.lazyInitializer.InitError(); err != nil {
+					return nil, fmt.Errorf("initialization failed: %w", err)
+				}
+				logger.Info("Initialization complete, dialing via proxy", "address", addr)
+				// Fall through to normal proxy dial below
+			}
+		} else {
+			// Non-proxy route: use direct connection while initializing
+			logger.Debug("Initialization in progress, using direct connection", "address", addr)
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, network, addr)
+		}
 	}
 
 	// Try primary route (proxy)
