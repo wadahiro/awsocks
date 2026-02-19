@@ -14,7 +14,7 @@ type MessageType byte
 
 const (
 	// Connection management
-	MsgConnect       MessageType = 0x01
+	MsgConnect       MessageType = 0x01 // Deprecated: proxy connections are now handled on the host side
 	MsgConnectAck    MessageType = 0x02
 	MsgData          MessageType = 0x03
 	MsgClose         MessageType = 0x04
@@ -22,16 +22,16 @@ const (
 	MsgConnectDirect MessageType = 0x06 // VM NAT direct connection (bypass EC2)
 
 	// Credential management
-	MsgCredentialUpdate MessageType = 0x10
+	MsgCredentialUpdate MessageType = 0x10 // Deprecated: credentials are now managed on the host side
 
 	// Control messages
 	MsgPing     MessageType = 0x20
 	MsgPong     MessageType = 0x21
 	MsgShutdown MessageType = 0x22
-	MsgSuspend  MessageType = 0x23 // Idle suspend: close backend without reconnect
+	MsgSuspend  MessageType = 0x23 // Deprecated: suspend/resume is now handled on the host side
 
 	// Backend configuration
-	MsgBackendConfig MessageType = 0x30
+	MsgBackendConfig MessageType = 0x30 // Deprecated: backend configuration is now on the host side
 
 	// Agent log forwarding
 	MsgLog MessageType = 0x40

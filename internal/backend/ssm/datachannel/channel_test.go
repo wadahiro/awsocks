@@ -3,6 +3,7 @@ package datachannel
 import (
 	"bytes"
 	"context"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"sync"
@@ -379,6 +380,82 @@ func TestDataChannel_ProcessInputMessage_ACKError(t *testing.T) {
 	// Should return error since ACK sending fails
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "ACK")
+}
+
+// TestDataChannel_NoDeadlock_OutputAndInput verifies that processOutputMessage
+// does not hold d.mu while calling onOutputData, preventing deadlock with
+// concurrent SendInputData calls.
+//
+// This is a regression test for a deadlock that occurred during SSH handshake
+// over SSM DataChannel:
+//   - Thread A: processOutputMessage holds d.mu -> deliverMessage -> onOutputData
+//     -> net.Pipe Write (blocks until SSH client reads)
+//   - Thread B: transferDataToSSM -> SendInputData -> sendMessage -> d.mu.Lock (deadlock)
+//
+// The fix moves deliverMessage calls outside the d.mu lock.
+func TestDataChannel_NoDeadlock_OutputAndInput(t *testing.T) {
+	mock := newMockWebSocket(t)
+	defer mock.Close()
+
+	dc := NewDataChannel()
+	ctx := context.Background()
+
+	err := dc.Open(ctx, mock.URL())
+	require.NoError(t, err)
+	defer dc.Close()
+
+	// Simulate the SSH <-> DataChannel bridge using net.Pipe.
+	// onOutputData writes to dcConn (blocks until sshConn reads).
+	sshConn, dcConn := net.Pipe()
+	defer sshConn.Close()
+	defer dcConn.Close()
+
+	dc.SetOnOutputData(func(data []byte) {
+		// This simulates backend.setupDataChannelOutput: write to dcConn.
+		// net.Pipe is unbuffered, so this blocks until the other end reads.
+		dcConn.Write(data)
+	})
+
+	// Channel to detect deadlock
+	done := make(chan struct{})
+
+	go func() {
+		defer close(done)
+
+		// Simulate receiving output from SSM agent (like SSH handshake response).
+		// This triggers processOutputMessage -> deliverMessage -> onOutputData -> dcConn.Write (blocks).
+		outputMsg := createOutputMessage([]byte("ssh-handshake-response"), 0)
+		data, _ := outputMsg.Serialize()
+		dc.ProcessMessage(data)
+	}()
+
+	// Give processOutputMessage time to enter onOutputData and block on dcConn.Write.
+	time.Sleep(50 * time.Millisecond)
+
+	// Simulate transferDataToSSM calling SendInputData concurrently.
+	// If d.mu is held during onOutputData, this will deadlock.
+	sendDone := make(chan error, 1)
+	go func() {
+		sendDone <- dc.SendInputData([]byte("ssh-handshake-request"))
+	}()
+
+	select {
+	case err := <-sendDone:
+		assert.NoError(t, err, "SendInputData should succeed without deadlock")
+	case <-time.After(3 * time.Second):
+		t.Fatal("DEADLOCK: SendInputData blocked because processOutputMessage holds d.mu during onOutputData")
+	}
+
+	// Unblock dcConn.Write by reading from sshConn
+	buf := make([]byte, 1024)
+	sshConn.Read(buf)
+
+	// Wait for processOutputMessage to complete
+	select {
+	case <-done:
+	case <-time.After(3 * time.Second):
+		t.Fatal("processOutputMessage did not complete")
+	}
 }
 
 func createOutputMessage(payload []byte, seqNum int64) *ClientMessage {

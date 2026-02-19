@@ -113,6 +113,11 @@ func (r *DefaultRouter) DefaultRoute() Route {
 	return r.defaultRoute
 }
 
+// HasVMDirectRoutes returns true if any vm-direct routes are configured
+func (r *DefaultRouter) HasVMDirectRoutes() bool {
+	return len(r.vmDirectMatchers) > 0
+}
+
 // FallbackRoute returns the fallback route for the given route.
 // Returns empty string if no fallback is available.
 //

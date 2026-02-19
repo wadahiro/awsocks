@@ -15,7 +15,6 @@ import (
 	"github.com/vishvananda/netlink"
 	"github.com/wadahiro/awsocks/internal/agent"
 	"github.com/wadahiro/awsocks/internal/log"
-	"github.com/wadahiro/awsocks/internal/protocol"
 )
 
 var logger = log.For(log.ComponentAgent)
@@ -56,8 +55,8 @@ func main() {
 
 	logger.Info("Connected to host via vsock")
 
-	// 5. Create and run agent (without backend for now - will be configured via protocol)
-	agentInstance := agent.NewWithoutBackend(conn)
+	// 5. Create and run agent (handles direct connections via VM NAT)
+	agentInstance := agent.New(conn)
 	if err := agentInstance.Run(); err != nil {
 		logger.Error("Agent error", "error", err)
 	}
@@ -195,5 +194,3 @@ func connectToHost() (net.Conn, error) {
 	return nil, fmt.Errorf("failed to connect after 30 attempts: %w", err)
 }
 
-// Ensure protocol package is imported for message types
-var _ = protocol.MsgConnect

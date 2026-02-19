@@ -4,20 +4,17 @@ package proxy
 import (
 	"context"
 	"fmt"
-	golog "log"
 	"net"
-	"os"
 	"sync"
 	"time"
 
-	gosocks5 "github.com/armon/go-socks5"
+	"github.com/wadahiro/awsocks/internal/awsapi"
 	"github.com/wadahiro/awsocks/internal/backend"
-	ssmbackend "github.com/wadahiro/awsocks/internal/backend/ssm"
 	"github.com/wadahiro/awsocks/internal/clock"
 	"github.com/wadahiro/awsocks/internal/credentials"
 	ec2pkg "github.com/wadahiro/awsocks/internal/ec2"
 	"github.com/wadahiro/awsocks/internal/log"
-	"github.com/wadahiro/awsocks/internal/mode"
+	"github.com/wadahiro/awsocks/internal/mux"
 	"github.com/wadahiro/awsocks/internal/protocol"
 	"github.com/wadahiro/awsocks/internal/routing"
 	"github.com/wadahiro/awsocks/internal/vm"
@@ -30,7 +27,6 @@ type Config struct {
 	Profile    string
 	Region     string
 	ListenAddr string
-	Mode       mode.ExecutionMode
 	Backend    string
 	RemotePort int
 
@@ -44,66 +40,54 @@ type Config struct {
 	AutoStop  bool // --auto-stop
 
 	// Routing settings
-	RoutingConfigPath string           // --routing-config (deprecated, use RoutingConfig)
-	RoutingConfig     *routing.Config  // Direct routing config (takes precedence over RoutingConfigPath)
+	RoutingConfigPath string          // --routing-config (deprecated, use RoutingConfig)
+	RoutingConfig     *routing.Config // Direct routing config (takes precedence over RoutingConfigPath)
 
 	// Lazy connection settings
 	LazyConnect bool // --lazy
 
 	// Idle timeout settings
 	IdleTimeout time.Duration
+
+	// AWS API route: "direct" (default) or "vm"
+	AWSAPIRoute string
 }
 
-// Manager manages the proxy lifecycle
-type Manager interface {
-	Start(ctx context.Context) error
-	Stop() error
-}
-
-// NewManager creates the appropriate proxy manager based on mode
-func NewManager(cfg *Config) (Manager, error) {
-	actualMode := mode.SelectMode(cfg.Mode)
-
-	switch actualMode {
-	case mode.ModeVM:
-		if !mode.IsVMSupported() {
-			return nil, fmt.Errorf("VM mode is only supported on macOS")
-		}
-		return NewVMManager(cfg)
-	case mode.ModeDirect:
-		return NewDirectManager(cfg)
-	default:
-		return nil, fmt.Errorf("unknown mode: %v", actualMode)
-	}
-}
-
-// VMManager uses Virtualization.framework + VM Agent
-type VMManager struct {
-	cfg                *Config
-	vm                 *vm.ProxyVM
-	socks5             *SOCKS5Server
-	credProv           *credentials.Provider
-	agentConn          net.Conn
-	ec2Client          ec2pkg.Client
-	resolvedInstanceID string
-	ctx                context.Context
-	cancel             context.CancelFunc
-	idleTracker        *IdleTracker
-	clock              clock.Clock
-
-	// Lazy initialization state
-	awsInitialized bool
-	awsInitMu      sync.Mutex
-	initDone       chan struct{} // closed when initialization completes
-	initErr        error        // stores initialization error
+// Dialer is an interface for dialing connections (subset of backend.Backend)
+type Dialer interface {
+	Dial(ctx context.Context, network, address string) (net.Conn, error)
 }
 
 var logger = log.For(log.ComponentManager)
 
-// NewVMManager creates a new VM-based proxy manager
-func NewVMManager(cfg *Config) (*VMManager, error) {
+// Manager manages the proxy lifecycle
+type Manager struct {
+	cfg                *Config
+	vm                 *vm.ProxyVM         // only when needsVM
+	agentMux           *mux.AgentMux       // only when needsVM (shared multiplexer)
+	awsClient          *awsapi.Client      // only when needsProxy
+	backend            backend.Backend     // only when needsProxy
+	credProv           *credentials.Provider
+	socks5             *SOCKS5Server
+	router             routing.Router
+	idleTracker        *IdleTracker
+	clock              clock.Clock
+	resolvedInstanceID string
+	ec2Client          ec2pkg.Client
+	ctx                context.Context
+	cancel             context.CancelFunc
+
+	// Lazy initialization state
+	awsInitialized bool
+	awsInitMu      sync.Mutex
+	initDone       chan struct{}
+	initErr        error
+}
+
+// NewManager creates a new proxy manager
+func NewManager(cfg *Config) (*Manager, error) {
 	ctx, cancel := context.WithCancel(context.Background())
-	return &VMManager{
+	return &Manager{
 		cfg:      cfg,
 		credProv: credentials.NewProvider(cfg.Profile, cfg.Region),
 		ctx:      ctx,
@@ -113,36 +97,130 @@ func NewVMManager(cfg *Config) (*VMManager, error) {
 	}, nil
 }
 
-// Start starts the VM-based proxy
-func (m *VMManager) Start(ctx context.Context) error {
-	logger.Info("Starting VM mode...")
+// Start starts the proxy
+func (m *Manager) Start(ctx context.Context) error {
+	// 1. Create router
+	m.router = m.createRouter()
 
-	// Setup idle tracker if configured
-	if m.cfg.IdleTimeout > 0 {
+	// Determine what we need
+	needsVM := m.needsVM()
+	needsProxy := m.needsProxy()
+
+	if needsVM {
+		logger.Info("VM required (vm-direct routes or aws-api-route=vm)")
+	}
+	if needsProxy {
+		logger.Info("Proxy required (instance configured)")
+	}
+	if !needsVM && !needsProxy {
+		logger.Info("Direct-only mode (no VM, no proxy)")
+	}
+
+	// 2. Setup idle tracker
+	if m.cfg.IdleTimeout > 0 && needsProxy {
 		m.idleTracker = NewIdleTracker(m.cfg.IdleTimeout, m.clock, func() {
 			m.suspend()
 		})
 		logger.Info("Idle timeout configured", "timeout", m.cfg.IdleTimeout)
 	}
 
-	// For non-lazy mode, initialize AWS immediately
-	if !m.cfg.LazyConnect {
-		if err := m.initializeAWS(ctx); err != nil {
+	// 3. Start VM if needed
+	if needsVM {
+		if err := m.startVM(ctx); err != nil {
+			return err
+		}
+	}
+
+	// 4. Initialize proxy if needed and not lazy
+	if needsProxy && !m.cfg.LazyConnect {
+		if err := m.initializeProxy(ctx); err != nil {
 			return err
 		}
 		close(m.initDone)
 
-		// Start idle tracker after successful initialization
 		if m.idleTracker != nil {
 			m.idleTracker.Start()
 		}
-	} else {
-		// Lazy mode: store instance ID if provided directly (not via name)
+	} else if needsProxy {
 		m.resolvedInstanceID = m.cfg.InstanceID
 		logger.Info("Lazy connection mode: AWS initialization deferred until first proxy request")
 	}
 
-	// Create and start VM
+	// 5. Create and start SOCKS5 server
+	m.socks5 = NewSOCKS5Server(m.cfg, m.router, m.agentMux)
+
+	if m.backend != nil {
+		m.socks5.SetBackend(m.backend)
+	}
+
+	if needsProxy && (m.cfg.LazyConnect || m.cfg.IdleTimeout > 0) {
+		m.socks5.SetLazyInitializer(m)
+	}
+
+	if m.idleTracker != nil {
+		m.socks5.SetIdleTracker(m.idleTracker)
+	}
+
+	logger.Info("Starting SOCKS5 proxy", "listen", m.cfg.ListenAddr)
+	return m.socks5.Start()
+}
+
+// needsVM determines if a VM should be started
+func (m *Manager) needsVM() bool {
+	// VM needed if aws-api-route=vm
+	if m.cfg.AWSAPIRoute == "vm" {
+		return true
+	}
+
+	// VM needed if any vm-direct routes are configured
+	if r, ok := m.router.(*routing.DefaultRouter); ok {
+		return r.HasVMDirectRoutes()
+	}
+
+	return false
+}
+
+// needsProxy determines if proxy (SSM backend) is needed
+func (m *Manager) needsProxy() bool {
+	return m.cfg.InstanceID != "" || m.cfg.Name != ""
+}
+
+// createRouter creates the appropriate router
+func (m *Manager) createRouter() routing.Router {
+	// VM mode is determined by config, not by old mode flag
+	hasVMDirect := false
+	if m.cfg.RoutingConfig != nil && len(m.cfg.RoutingConfig.VMDirect) > 0 {
+		hasVMDirect = true
+	}
+	needsVM := m.cfg.AWSAPIRoute == "vm" || hasVMDirect
+
+	var opts []routing.RouterOption
+	if needsVM {
+		opts = append(opts, routing.WithVMMode())
+	}
+
+	if m.cfg.RoutingConfig != nil {
+		router := routing.NewRouter(m.cfg.RoutingConfig, opts...)
+		logger.Info("Routing config loaded", "default", m.cfg.RoutingConfig.Default)
+		return router
+	}
+
+	if m.cfg.RoutingConfigPath != "" {
+		cfg, err := routing.LoadConfig(m.cfg.RoutingConfigPath)
+		if err != nil {
+			logger.Warn("Failed to load routing config, using defaults", "error", err)
+			return routing.NewDefaultRouter(opts...)
+		}
+		router := routing.NewRouter(cfg, opts...)
+		logger.Info("Routing config loaded", "path", m.cfg.RoutingConfigPath, "default", cfg.Default)
+		return router
+	}
+
+	return routing.NewDefaultRouter(opts...)
+}
+
+// startVM creates and starts the VM, waits for agent connection
+func (m *Manager) startVM(ctx context.Context) error {
 	logger.Info("Creating VM...")
 	proxyVM, err := vm.NewProxyVM()
 	if err != nil {
@@ -156,7 +234,6 @@ func (m *VMManager) Start(ctx context.Context) error {
 		return fmt.Errorf("failed to start VM: %w", err)
 	}
 
-	// Wait for agent to connect
 	logger.Info("Waiting for agent to connect via vsock...")
 	agentConn, err := proxyVM.WaitForAgent(ctx)
 	if err != nil {
@@ -164,508 +241,115 @@ func (m *VMManager) Start(ctx context.Context) error {
 		proxyVM.Cleanup()
 		return fmt.Errorf("failed to connect to agent: %w", err)
 	}
-	m.agentConn = agentConn
+	// Create shared multiplexer with log handler
+	m.agentMux = mux.NewAgentMux(agentConn, mux.WithLogHandler(handleAgentLog))
 	logger.Info("Agent connected")
 
-	// Send backend configuration first (before credentials)
-	if err := m.sendBackendConfig(); err != nil {
-		return fmt.Errorf("failed to send backend config: %w", err)
-	}
-
-	// For non-lazy mode, send credentials and start refresh loop
-	if !m.cfg.LazyConnect {
-		// Send initial credentials
-		if err := m.sendCredentials(); err != nil {
-			logger.Warn("failed to send initial credentials", "error", err)
-		}
-
-		// Start credential refresh goroutine
-		go m.credentialRefreshLoop(ctx)
-	}
-
-	// Initialize router for VM mode (with vm-direct support)
-	var router routing.Router
-	if m.cfg.RoutingConfig != nil {
-		// Direct routing config takes precedence
-		router = routing.NewRouter(m.cfg.RoutingConfig, routing.WithVMMode())
-		logger.Info("Routing config loaded", "default", m.cfg.RoutingConfig.Default)
-	} else if m.cfg.RoutingConfigPath != "" {
-		cfg, err := routing.LoadConfig(m.cfg.RoutingConfigPath)
-		if err != nil {
-			return fmt.Errorf("failed to load routing config: %w", err)
-		}
-		router = routing.NewRouter(cfg, routing.WithVMMode())
-		logger.Info("Routing config loaded", "path", m.cfg.RoutingConfigPath, "default", cfg.Default)
-	} else {
-		router = routing.NewDefaultRouter(routing.WithVMMode())
-	}
-
-	// Start SOCKS5 server (pass VMManager reference for lazy init)
-	m.socks5 = NewSOCKS5Server(m.cfg.ListenAddr, agentConn, router)
-	if m.cfg.LazyConnect || m.cfg.IdleTimeout > 0 {
-		m.socks5.SetVMManager(m)
-	}
-	if m.idleTracker != nil {
-		m.socks5.SetIdleTracker(m.idleTracker)
-	}
-	logger.Info("Starting SOCKS5 proxy", "listen", m.cfg.ListenAddr)
-
-	return m.socks5.Start()
+	return nil
 }
 
-// initializeAWS performs AWS-related initialization (credential provider, config loading, instance resolution)
-func (m *VMManager) initializeAWS(ctx context.Context) error {
-	// Start credential provider (loads config and credentials)
+// handleAgentLog processes log messages forwarded from the VM agent.
+func handleAgentLog(payload *protocol.LogPayload) {
+	agentLogger := log.For(log.ComponentAgent)
+	switch payload.Level {
+	case "debug":
+		agentLogger.Debug(payload.Message)
+	case "info":
+		agentLogger.Info(payload.Message)
+	case "warn":
+		agentLogger.Warn(payload.Message)
+	case "error":
+		agentLogger.Error(payload.Message)
+	default:
+		agentLogger.Info(payload.Message)
+	}
+}
+
+// initializeProxy performs AWS-related initialization
+func (m *Manager) initializeProxy(ctx context.Context) error {
+	// Start credential provider
 	if err := m.credProv.Start(ctx); err != nil {
 		return fmt.Errorf("failed to start credential provider: %w", err)
 	}
 
-	// Reuse the AWS config cached by credential provider (avoids duplicate LoadDefaultConfig)
 	awsCfg := m.credProv.GetConfig()
-	m.ec2Client = ec2pkg.NewClient(*awsCfg)
 
-	// Resolve instance ID from Name tag if needed
-	if m.cfg.InstanceID == "" && m.cfg.Name != "" {
-		resolvedID, state, err := m.resolveInstanceByName(ctx)
-		if err != nil {
-			return fmt.Errorf("failed to resolve instance: %w", err)
-		}
-		m.resolvedInstanceID = resolvedID
-		logger.Info("Resolved instance", "name", m.cfg.Name, "id", resolvedID, "state", state)
-
-		// Auto-start instance if stopped
-		if m.cfg.AutoStart && state == "stopped" {
-			logger.Info("Instance is stopped, starting...", "instance", resolvedID)
-			instMgr := ec2pkg.NewInstanceManager(m.ec2Client)
-			if err := instMgr.StartAndWait(ctx, resolvedID, 5*time.Minute); err != nil {
-				return fmt.Errorf("failed to start instance: %w", err)
-			}
-			logger.Info("Instance is now running", "instance", resolvedID)
-		}
+	// Determine dial function based on aws-api-route
+	var dialFn awsapi.DialContextFunc
+	if m.cfg.AWSAPIRoute == "vm" && m.agentMux != nil {
+		dialFn = awsapi.NewVsockDialer(m.agentMux)
+		logger.Info("AWS API route: vm (via VM NAT)")
 	} else {
-		m.resolvedInstanceID = m.cfg.InstanceID
+		logger.Info("AWS API route: direct")
 	}
 
-	return nil
-}
+	// Create unified AWS client
+	m.awsClient = awsapi.NewClient(*awsCfg, dialFn)
+	m.ec2Client = m.awsClient.EC2Client()
 
-// EnsureInitialized performs lazy AWS initialization on first proxy request
-// This is called from SOCKS5Server when LazyConnect is enabled
-func (m *VMManager) EnsureInitialized(ctx context.Context) error {
-	m.awsInitMu.Lock()
-	defer m.awsInitMu.Unlock()
-
-	if m.awsInitialized {
-		return nil
-	}
-
-	// Enable auto-start when resuming from suspend (EC2 is stopped)
-	wasSuspended := m.idleTracker != nil && m.idleTracker.IsSuspended()
-	if wasSuspended {
-		m.cfg.AutoStart = true
-		logger.Info("Resuming from idle suspend: auto-start enabled")
-	}
-
-	logger.Info("Lazy initialization: starting AWS credential and instance resolution...")
-
-	// 1. Initialize AWS (credential provider, config, instance resolution)
-	if err := m.initializeAWS(ctx); err != nil {
-		m.initErr = err
-		close(m.initDone)
-		m.initDone = make(chan struct{}) // new channel for retry
-		return err
-	}
-
-	// 2. Re-send BackendConfig with resolved instance ID
-	if err := m.sendBackendConfig(); err != nil {
-		m.initErr = fmt.Errorf("failed to send backend config: %w", err)
-		close(m.initDone)
-		m.initDone = make(chan struct{}) // new channel for retry
-		return m.initErr
-	}
-
-	// 3. Send credentials to agent
-	if err := m.sendCredentials(); err != nil {
-		m.initErr = fmt.Errorf("failed to send credentials: %w", err)
-		close(m.initDone)
-		m.initDone = make(chan struct{}) // new channel for retry
-		return m.initErr
-	}
-
-	// 4. Start credential refresh loop
-	go m.credentialRefreshLoop(m.ctx)
-
-	m.awsInitialized = true
-	m.initErr = nil
-	close(m.initDone)
-
-	// Clear suspended state and restart idle tracker
-	if m.idleTracker != nil {
-		m.idleTracker.ClearSuspended()
-		m.idleTracker.Start()
-	}
-
-	logger.Info("Lazy initialization completed")
-
-	return nil
-}
-
-// InitDone returns a channel that is closed when initialization completes (success or failure)
-func (m *VMManager) InitDone() <-chan struct{} {
-	return m.initDone
-}
-
-// InitError returns the initialization error, if any
-func (m *VMManager) InitError() error {
-	return m.initErr
-}
-
-// suspend stops the EC2 instance and resets initialization state for re-initialization.
-// VM itself is NOT stopped (restart takes too long); only EC2 and backend connections are disconnected.
-func (m *VMManager) suspend() {
-	m.awsInitMu.Lock()
-	defer m.awsInitMu.Unlock()
-
-	if !m.awsInitialized {
-		return
-	}
-
-	logger.Info("Idle timeout: suspending EC2 instance (VM stays running)...", "instance", m.resolvedInstanceID)
-
-	// 1. Send suspend message to agent (closes backend without reconnect)
-	if m.agentConn != nil {
-		msg := &protocol.Message{Type: protocol.MsgSuspend}
-		if err := protocol.WriteMessage(m.agentConn, msg); err != nil {
-			logger.Warn("failed to send suspend to agent", "error", err)
-		}
-	}
-
-	// 2. Reset initialization state
-	m.awsInitialized = false
-	m.initDone = make(chan struct{})
-	m.initErr = nil
-
-	// 3. Stop EC2 instance
-	if m.resolvedInstanceID != "" && m.ec2Client != nil {
-		instMgr := ec2pkg.NewInstanceManager(m.ec2Client)
-		if err := instMgr.Stop(context.Background(), m.resolvedInstanceID); err != nil {
-			logger.Warn("failed to stop instance during suspend", "error", err)
-		} else {
-			logger.Info("EC2 instance stop initiated", "instance", m.resolvedInstanceID)
-		}
-	}
-
-	// 4. Stop and re-create credential provider
-	if m.credProv != nil {
-		m.credProv.Stop()
-	}
-	m.credProv = credentials.NewProvider(m.cfg.Profile, m.cfg.Region)
-
-	// 5. Re-create context (for credential refresh loop)
-	m.cancel()
-	m.ctx, m.cancel = context.WithCancel(context.Background())
-
-	logger.Info("Suspend complete, waiting for new proxy requests to trigger re-initialization")
-}
-
-// Stop stops the VM-based proxy
-func (m *VMManager) Stop() error {
-	m.cancel()
-
-	if m.idleTracker != nil {
-		m.idleTracker.Stop()
-	}
-
-	if m.socks5 != nil {
-		m.socks5.Stop()
-	}
-
-	if m.agentConn != nil {
-		// Send shutdown message
-		msg := &protocol.Message{Type: protocol.MsgShutdown}
-		protocol.WriteMessage(m.agentConn, msg)
-		m.agentConn.Close()
-	}
-
-	if m.vm != nil {
-		m.vm.Stop()
-		m.vm.Cleanup()
-	}
-
-	if m.credProv != nil {
-		m.credProv.Stop()
-	}
-
-	return nil
-}
-
-func (m *VMManager) sendBackendConfig() error {
-	// Read SSH key file
-	keyContent, err := os.ReadFile(m.cfg.SSHKeyPath)
-	if err != nil {
-		return fmt.Errorf("failed to read SSH key: %w", err)
-	}
-
-	// Use resolved instance ID (from --name resolution or direct --instance-id)
-	instanceID := m.resolvedInstanceID
-	if instanceID == "" {
-		instanceID = m.cfg.InstanceID
-	}
-
-	cfg := &protocol.BackendConfigPayload{
-		Type:             "muxssh",
-		InstanceID:       instanceID,
-		Region:           m.cfg.Region,
-		SSHUser:          m.cfg.SSHUser,
-		SSHKeyContent:    keyContent,
-		SSHKeyPassphrase: m.cfg.SSHKeyPassphrase,
-		LazyConnect:      m.cfg.LazyConnect,
-	}
-
-	msg := protocol.NewBackendConfigMessage(cfg)
-	if err := protocol.WriteMessage(m.agentConn, msg); err != nil {
-		return fmt.Errorf("failed to send backend config: %w", err)
-	}
-
-	logger.Info("Backend config sent to agent")
-	return nil
-}
-
-func (m *VMManager) sendCredentials() error {
-	creds := m.credProv.GetLastCredentials()
-
-	msg := protocol.NewCredentialUpdateMessage(protocol.CredentialPayload{
-		AccessKeyID:     creds.AccessKeyID,
-		SecretAccessKey: creds.SecretAccessKey,
-		SessionToken:    creds.SessionToken,
-		Expiration:      creds.Expires,
-	})
-
-	return protocol.WriteMessage(m.agentConn, msg)
-}
-
-func (m *VMManager) resolveInstanceByName(ctx context.Context) (string, string, error) {
-	resolver := ec2pkg.NewResolver(m.ec2Client)
-
-	instances, err := resolver.ResolveByName(ctx, m.cfg.Name)
-	if err != nil {
-		return "", "", err
-	}
-
-	if len(instances) == 0 {
-		return "", "", fmt.Errorf("no instances found with name '%s'", m.cfg.Name)
-	}
-
-	if len(instances) == 1 {
-		logger.Info("Found instance", "name", instances[0].Name, "id", instances[0].ID, "state", instances[0].State)
-		return instances[0].ID, instances[0].State, nil
-	}
-
-	// Multiple instances found - use the first one
-	logger.Info("Found multiple instances, using first", "count", len(instances), "name", instances[0].Name, "id", instances[0].ID, "state", instances[0].State)
-	return instances[0].ID, instances[0].State, nil
-}
-
-func (m *VMManager) credentialRefreshLoop(ctx context.Context) {
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case creds := <-m.credProv.RefreshChannel():
-			logger.Debug("Sending updated credentials to agent...")
-			msg := protocol.NewCredentialUpdateMessage(protocol.CredentialPayload{
-				AccessKeyID:     creds.AccessKeyID,
-				SecretAccessKey: creds.SecretAccessKey,
-				SessionToken:    creds.SessionToken,
-				Expiration:      creds.Expires,
-			})
-
-			if err := protocol.WriteMessage(m.agentConn, msg); err != nil {
-				logger.Error("Failed to send credentials", "error", err)
-			} else {
-				logger.Debug("Credentials sent successfully")
-			}
-		}
-	}
-}
-
-// DirectManager runs SSM client directly without VM
-type DirectManager struct {
-	cfg                *Config
-	socks5             *DirectSOCKS5Server
-	backend            backend.Backend
-	credProv           *credentials.Provider
-	ctx                context.Context
-	cancel             context.CancelFunc
-	resolvedInstanceID string        // resolved instance ID for auto-stop
-	ec2Client          ec2pkg.Client // EC2 client for instance management
-	idleTracker        *IdleTracker
-	clock              clock.Clock
-
-	// Lazy initialization state
-	awsInitialized bool
-	awsInitMu      sync.Mutex
-	initDone       chan struct{} // closed when initialization completes
-	initErr        error        // stores initialization error
-}
-
-// NewDirectManager creates a new direct proxy manager
-func NewDirectManager(cfg *Config) (*DirectManager, error) {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &DirectManager{
-		cfg:      cfg,
-		credProv: credentials.NewProvider(cfg.Profile, cfg.Region),
-		ctx:      ctx,
-		cancel:   cancel,
-		initDone: make(chan struct{}),
-		clock:    clock.RealClock{},
-	}, nil
-}
-
-// Start starts the direct proxy
-func (m *DirectManager) Start(ctx context.Context) error {
-	logger.Info("Starting direct mode (no VM)...")
-
-	// Setup idle tracker if configured
-	if m.cfg.IdleTimeout > 0 {
-		m.idleTracker = NewIdleTracker(m.cfg.IdleTimeout, m.clock, func() {
-			m.suspend()
-		})
-		logger.Info("Idle timeout configured", "timeout", m.cfg.IdleTimeout)
-	}
-
-	// For non-lazy mode, initialize AWS immediately
-	if !m.cfg.LazyConnect {
-		if err := m.initializeAWS(ctx); err != nil {
-			return err
-		}
-		close(m.initDone)
-
-		// Start idle tracker after successful initialization
-		if m.idleTracker != nil {
-			m.idleTracker.Start()
-		}
-	} else {
-		// Lazy mode: store instance ID if provided directly (not via name)
-		m.resolvedInstanceID = m.cfg.InstanceID
-		logger.Info("Lazy connection mode: AWS initialization deferred until first proxy request")
-	}
-
-	// Initialize router
-	var router routing.Router
-	if m.cfg.RoutingConfig != nil {
-		// Direct routing config takes precedence
-		router = routing.NewRouter(m.cfg.RoutingConfig)
-		logger.Info("Routing config loaded", "default", m.cfg.RoutingConfig.Default)
-	} else if m.cfg.RoutingConfigPath != "" {
-		cfg, err := routing.LoadConfig(m.cfg.RoutingConfigPath)
-		if err != nil {
-			return fmt.Errorf("failed to load routing config: %w", err)
-		}
-		router = routing.NewRouter(cfg)
-		logger.Info("Routing config loaded", "path", m.cfg.RoutingConfigPath, "default", cfg.Default)
-	} else {
-		router = routing.NewDefaultRouter()
-	}
-
-	m.socks5 = NewDirectSOCKS5Server(m.cfg, m, router)
-	if m.cfg.LazyConnect || m.cfg.IdleTimeout > 0 {
-		// IdleTimeout needs lazyInitializer for suspend→resume re-initialization
-		m.socks5.SetLazyInitializer(m)
-	}
-	if m.idleTracker != nil {
-		m.socks5.SetIdleTracker(m.idleTracker)
-	}
-	logger.Info("Starting SOCKS5 proxy", "listen", m.cfg.ListenAddr)
-
-	return m.socks5.Start()
-}
-
-// initializeAWS performs AWS-related initialization (credential provider, config loading, instance resolution)
-func (m *DirectManager) initializeAWS(ctx context.Context) error {
-	// Start credential provider (loads config and credentials)
-	if err := m.credProv.Start(ctx); err != nil {
-		return fmt.Errorf("failed to start credential provider: %w", err)
-	}
-
-	// Reuse the AWS config cached by credential provider (avoids duplicate LoadDefaultConfig)
-	awsCfg := m.credProv.GetConfig()
-	m.ec2Client = ec2pkg.NewClient(*awsCfg)
-
-	// Resolve instance ID from Name tag if needed
+	// Resolve instance ID
 	instanceID := m.cfg.InstanceID
 	instanceState := ""
 	if instanceID == "" && m.cfg.Name != "" {
-		resolvedID, state, err := m.resolveInstanceByName(ctx)
+		resolvedID, state, err := m.awsClient.ResolveInstanceByName(ctx, m.cfg.Name)
 		if err != nil {
 			return fmt.Errorf("failed to resolve instance: %w", err)
 		}
 		instanceID = resolvedID
 		instanceState = state
-		m.resolvedInstanceID = instanceID
+		logger.Info("Resolved instance", "name", m.cfg.Name, "id", resolvedID, "state", state)
 	} else if instanceID != "" {
-		// Get instance state for directly specified instance ID
-		m.resolvedInstanceID = instanceID
 		if m.cfg.AutoStart {
-			instMgr := ec2pkg.NewInstanceManager(m.ec2Client)
-			state, err := instMgr.GetInstanceState(ctx, instanceID)
+			state, err := m.awsClient.GetInstanceState(ctx, instanceID)
 			if err != nil {
 				return fmt.Errorf("failed to get instance state: %w", err)
 			}
 			instanceState = state
 		}
 	}
+	m.resolvedInstanceID = instanceID
 
-	// Auto-start instance if stopped
-	if instanceID != "" && m.cfg.AutoStart && instanceState == "stopped" {
-		logger.Info("Instance is stopped, starting...", "instance", instanceID)
-		instMgr := ec2pkg.NewInstanceManager(m.ec2Client)
-		if err := instMgr.StartAndWait(ctx, instanceID, 5*time.Minute); err != nil {
+	// Auto-start instance if stopped or stopping
+	if instanceID != "" && m.cfg.AutoStart && (instanceState == "stopped" || instanceState == "stopping") {
+		// If stopping, wait for it to fully stop first
+		if instanceState == "stopping" {
+			logger.Info("Instance is stopping, waiting for stopped state...", "instance", instanceID)
+			if err := m.awsClient.WaitForInstanceState(ctx, instanceID, "stopped", 3*time.Minute); err != nil {
+				return fmt.Errorf("failed to wait for instance to stop: %w", err)
+			}
+		}
+		logger.Info("Starting instance...", "instance", instanceID)
+		if err := m.awsClient.StartInstanceAndWait(ctx, instanceID, 5*time.Minute); err != nil {
 			return fmt.Errorf("failed to start instance: %w", err)
 		}
-		logger.Info("Instance is now running", "instance", instanceID)
+		logger.Info("Instance is now running, waiting for SSM agent...", "instance", instanceID)
+		if err := m.awsClient.WaitForSSMAgent(ctx, instanceID, 3*time.Minute); err != nil {
+			return fmt.Errorf("failed to wait for SSM agent: %w", err)
+		}
 	}
 
-	// Create and start backend if instance is configured
+	// Create and start SSM backend
 	if instanceID != "" {
-		ssmClient := ssmbackend.NewHTTPClient(*awsCfg)
-
-		// Default backend is "ssm" (muxssh)
-		backendType := m.cfg.Backend
-		if backendType == "" {
-			backendType = "ssm"
+		backendCfg := &awsapi.SSMBackendConfig{
+			InstanceID:   instanceID,
+			Region:       m.cfg.Region,
+			SSHUser:      m.cfg.SSHUser,
+			SSHKeyPath:   m.cfg.SSHKeyPath,
+			AutoStartEC2: m.cfg.AutoStart,
 		}
 
-		if backendType == "ssm" {
-			// SSM backend uses MuxSSH (SSH over SSM DataChannel)
-			logger.Info("Backend: muxssh", "instance", instanceID)
+		ssmBe := m.awsClient.NewSSMBackend(backendCfg)
 
-			backendConfig := &ssmbackend.Config{
-				InstanceID: instanceID,
-				Region:     m.cfg.Region,
-				SSHUser:    m.cfg.SSHUser,
-				SSHKeyPath: m.cfg.SSHKeyPath,
-			}
-
-			// Pass EC2 client for lazy connection auto-start
-			if m.cfg.AutoStart {
-				backendConfig.AutoStartEC2 = true
-				backendConfig.EC2Client = m.ec2Client
-			}
-
-			muxBackend := ssmbackend.New(backendConfig, ssmClient)
-
-			if err := muxBackend.Start(m.ctx); err != nil {
-				return fmt.Errorf("failed to start MuxSSH backend: %w", err)
-			}
-			m.backend = muxBackend
-
-			// Store credentials for backend (will connect on first Dial)
-			creds := m.credProv.GetLastCredentials()
-			muxBackend.SetCredentials(creds)
+		if err := ssmBe.Start(m.ctx); err != nil {
+			return fmt.Errorf("failed to start SSM backend: %w", err)
 		}
+		m.backend = ssmBe
 
-		// Start credential refresh loop for backend
+		// Store credentials for backend
+		creds := m.credProv.GetLastCredentials()
+		ssmBe.SetCredentials(creds)
+
+		// Start credential refresh loop
 		go m.credentialRefreshLoop(m.ctx)
 	}
 
@@ -673,8 +357,7 @@ func (m *DirectManager) initializeAWS(ctx context.Context) error {
 }
 
 // EnsureInitialized performs lazy AWS initialization on first proxy request
-// This is called from DirectSOCKS5Server when LazyConnect is enabled
-func (m *DirectManager) EnsureInitialized(ctx context.Context) error {
+func (m *Manager) EnsureInitialized(ctx context.Context) error {
 	m.awsInitMu.Lock()
 	defer m.awsInitMu.Unlock()
 
@@ -682,7 +365,7 @@ func (m *DirectManager) EnsureInitialized(ctx context.Context) error {
 		return nil
 	}
 
-	// Enable auto-start when resuming from suspend (EC2 is stopped)
+	// Enable auto-start when resuming from suspend
 	wasSuspended := m.idleTracker != nil && m.idleTracker.IsSuspended()
 	if wasSuspended {
 		m.cfg.AutoStart = true
@@ -691,15 +374,25 @@ func (m *DirectManager) EnsureInitialized(ctx context.Context) error {
 
 	logger.Info("Lazy initialization: starting AWS credential and instance resolution...")
 
-	if err := m.initializeAWS(ctx); err != nil {
+	if err := m.initializeProxy(ctx); err != nil {
+		// Cleanup credential provider to avoid leaking watchers on retry
+		if m.credProv != nil {
+			m.credProv.Stop()
+		}
+		m.credProv = credentials.NewProvider(m.cfg.Profile, m.cfg.Region)
+
+		// Re-create context for next attempt
+		m.cancel()
+		m.ctx, m.cancel = context.WithCancel(context.Background())
+
 		m.initErr = err
 		close(m.initDone)
-		m.initDone = make(chan struct{}) // new channel for retry
+		m.initDone = make(chan struct{})
 		return err
 	}
 
 	// Update socks5 server's backend reference
-	if m.socks5 != nil {
+	if m.socks5 != nil && m.backend != nil {
 		m.socks5.SetBackend(m.backend)
 	}
 
@@ -707,46 +400,44 @@ func (m *DirectManager) EnsureInitialized(ctx context.Context) error {
 	m.initErr = nil
 	close(m.initDone)
 
-	// Clear suspended state and restart idle tracker
+	// Clear suspended state. Idle timer will be restarted by the first
+	// successful proxy Dial (via socks5.dial -> idleTracker.Touch).
+	// Do NOT start the timer here because SSM backend connects lazily on
+	// first Dial, and the connection may take longer than the idle timeout.
 	if m.idleTracker != nil {
 		m.idleTracker.ClearSuspended()
-		m.idleTracker.Start()
 	}
 
 	logger.Info("Lazy initialization completed")
-
 	return nil
 }
 
-// InitDone returns a channel that is closed when initialization completes (success or failure)
-func (m *DirectManager) InitDone() <-chan struct{} {
+// InitDone returns a channel that is closed when initialization completes
+func (m *Manager) InitDone() <-chan struct{} {
 	return m.initDone
 }
 
 // InitError returns the initialization error, if any
-func (m *DirectManager) InitError() error {
+func (m *Manager) InitError() error {
 	return m.initErr
 }
 
-// GetBackend returns the current backend (may be nil if not initialized)
-func (m *DirectManager) GetBackend() backend.Backend {
+// GetBackend returns the current backend (may be nil)
+func (m *Manager) GetBackend() backend.Backend {
 	m.awsInitMu.Lock()
 	defer m.awsInitMu.Unlock()
 	return m.backend
 }
 
 // IsInitialized returns true if AWS initialization is complete
-func (m *DirectManager) IsInitialized() bool {
+func (m *Manager) IsInitialized() bool {
 	m.awsInitMu.Lock()
 	defer m.awsInitMu.Unlock()
 	return m.awsInitialized
 }
 
-
-// suspend stops the EC2 instance and resets initialization state for re-initialization.
-// After suspend, incoming RouteProxy requests will wait on the new initDone channel
-// and trigger re-initialization via EnsureInitialized.
-func (m *DirectManager) suspend() {
+// suspend stops the EC2 instance and resets initialization state
+func (m *Manager) suspend() {
 	m.awsInitMu.Lock()
 	defer m.awsInitMu.Unlock()
 
@@ -756,7 +447,7 @@ func (m *DirectManager) suspend() {
 
 	logger.Info("Idle timeout: suspending EC2 instance...", "instance", m.resolvedInstanceID)
 
-	// 1. Reset initialization state (new requests will wait on new initDone)
+	// 1. Reset initialization state
 	m.awsInitialized = false
 	m.initDone = make(chan struct{})
 	m.initErr = nil
@@ -790,38 +481,14 @@ func (m *DirectManager) suspend() {
 	logger.Info("Suspend complete, waiting for new proxy requests to trigger re-initialization")
 }
 
-// resolveInstanceByName resolves EC2 instance ID from Name tag
-// Returns instance ID and state
-// Note: m.ec2Client must be initialized before calling this method
-func (m *DirectManager) resolveInstanceByName(ctx context.Context) (string, string, error) {
-	resolver := ec2pkg.NewResolver(m.ec2Client)
-
-	// Search for instances
-	instances, err := resolver.ResolveByName(ctx, m.cfg.Name)
-	if err != nil {
-		return "", "", err
-	}
-
-	if len(instances) == 1 {
-		logger.Info("Found instance", "name", instances[0].Name, "id", instances[0].ID, "state", instances[0].State)
-		return instances[0].ID, instances[0].State, nil
-	}
-
-	// Multiple instances found - for now just use the first one
-	// TODO: Add interactive selection
-	logger.Info("Found multiple instances, using first", "count", len(instances), "name", instances[0].Name, "id", instances[0].ID, "state", instances[0].State)
-	return instances[0].ID, instances[0].State, nil
-}
-
 // credentialRefreshLoop sends updated credentials to the backend
-func (m *DirectManager) credentialRefreshLoop(ctx context.Context) {
+func (m *Manager) credentialRefreshLoop(ctx context.Context) {
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case creds := <-m.credProv.RefreshChannel():
 			if m.backend == nil {
-				// Backend not yet initialized, skip this update
 				continue
 			}
 			logger.Debug("Sending updated credentials to backend...")
@@ -834,8 +501,8 @@ func (m *DirectManager) credentialRefreshLoop(ctx context.Context) {
 	}
 }
 
-// Stop stops the direct proxy
-func (m *DirectManager) Stop() error {
+// Stop stops the proxy
+func (m *Manager) Stop() error {
 	m.cancel()
 
 	if m.idleTracker != nil {
@@ -844,6 +511,16 @@ func (m *DirectManager) Stop() error {
 
 	if m.socks5 != nil {
 		m.socks5.Stop()
+	}
+
+	if m.agentMux != nil {
+		m.agentMux.SendShutdown()
+		m.agentMux.Close()
+	}
+
+	if m.vm != nil {
+		m.vm.Stop()
+		m.vm.Cleanup()
 	}
 
 	if m.backend != nil {
@@ -868,233 +545,5 @@ func (m *DirectManager) Stop() error {
 	return nil
 }
 
-// Dialer is an interface for dialing connections (subset of backend.Backend)
-type Dialer interface {
-	Dial(ctx context.Context, network, address string) (net.Conn, error)
-}
-
-// DirectSOCKS5Server provides SOCKS5 proxy with direct network access
-type DirectSOCKS5Server struct {
-	cfg             *Config
-	backend         backend.Backend
-	dialer          Dialer // For testing without full backend
-	backendMu       sync.RWMutex
-	router          routing.Router
-	ctx             context.Context
-	cancel          context.CancelFunc
-	listener        net.Listener
-	listenerMu      sync.Mutex
-	lazyInitializer LazyInitializer
-	idleTracker     *IdleTracker
-}
-
-// NewDirectSOCKS5Server creates a new direct SOCKS5 server
-func NewDirectSOCKS5Server(cfg *Config, manager *DirectManager, router routing.Router) *DirectSOCKS5Server {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &DirectSOCKS5Server{
-		cfg:    cfg,
-		router: router,
-		ctx:    ctx,
-		cancel: cancel,
-	}
-}
-
-// SetLazyInitializer sets the lazy initializer for deferred AWS initialization
-func (s *DirectSOCKS5Server) SetLazyInitializer(initializer LazyInitializer) {
-	s.lazyInitializer = initializer
-}
-
-// SetIdleTracker sets the idle tracker for activity monitoring
-func (s *DirectSOCKS5Server) SetIdleTracker(tracker *IdleTracker) {
-	s.idleTracker = tracker
-}
-
-// SetBackend updates the backend after lazy initialization
-func (s *DirectSOCKS5Server) SetBackend(b backend.Backend) {
-	s.backendMu.Lock()
-	s.backend = b
-	s.backendMu.Unlock()
-}
-
-// GetBackend returns the current backend (thread-safe)
-func (s *DirectSOCKS5Server) GetBackend() backend.Backend {
-	s.backendMu.RLock()
-	defer s.backendMu.RUnlock()
-	return s.backend
-}
-
-// SetBackendDialer sets a simple dialer for testing
-func (s *DirectSOCKS5Server) SetBackendDialer(d Dialer) {
-	s.backendMu.Lock()
-	s.dialer = d
-	s.backendMu.Unlock()
-}
-
-// GetDialer returns the current dialer (thread-safe)
-func (s *DirectSOCKS5Server) GetDialer() Dialer {
-	s.backendMu.RLock()
-	defer s.backendMu.RUnlock()
-	if s.dialer != nil {
-		return s.dialer
-	}
-	return s.backend
-}
-
-// IsInitialized returns true if lazy initialization is complete
-func (s *DirectSOCKS5Server) IsInitialized() bool {
-	if s.lazyInitializer == nil {
-		return true
-	}
-	select {
-	case <-s.lazyInitializer.InitDone():
-		return true
-	default:
-		return false
-	}
-}
-
-// Start starts the direct SOCKS5 server
-func (s *DirectSOCKS5Server) Start() error {
-	dialer := &directDialer{
-		cfg:    s.cfg,
-		server: s,
-		router: s.router,
-	}
-
-	conf := &gosocks5.Config{
-		Dial:     dialer.Dial,
-		Resolver: &noopResolver{},
-		Logger:   golog.New(&slogWriter{}, "", 0),
-	}
-
-	server, err := gosocks5.New(conf)
-	if err != nil {
-		return fmt.Errorf("failed to create SOCKS5 server: %w", err)
-	}
-
-	listener, err := net.Listen("tcp", s.cfg.ListenAddr)
-	if err != nil {
-		return fmt.Errorf("failed to listen on %s: %w", s.cfg.ListenAddr, err)
-	}
-
-	s.listenerMu.Lock()
-	s.listener = listener
-	s.listenerMu.Unlock()
-
-	return server.Serve(listener)
-}
-
-// Stop stops the direct SOCKS5 server
-func (s *DirectSOCKS5Server) Stop() {
-	s.cancel()
-	s.listenerMu.Lock()
-	if s.listener != nil {
-		s.listener.Close()
-	}
-	s.listenerMu.Unlock()
-}
-
-type directDialer struct {
-	cfg    *Config
-	server *DirectSOCKS5Server
-	router routing.Router
-}
-
-// noopResolver is a NameResolver that does not resolve hostnames
-// It returns a nil IP so that the Dial function receives the original hostname
-type noopResolver struct{}
-
-func (r *noopResolver) Resolve(ctx context.Context, name string) (context.Context, net.IP, error) {
-	// Return nil IP to indicate no resolution was done
-	// The dialer will receive the original hostname
-	return ctx, nil, nil
-}
-
-func (d *directDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	host, _, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-
-	// Determine route first (needed for lazy init decision)
-	route := routing.RouteProxy
-	if d.router != nil {
-		route = d.router.Route(host)
-	}
-
-	// For direct route, connect directly (no need to wait for initialization)
-	if route == routing.RouteDirect {
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, network, addr)
-	}
-
-	// Check if lazy initialization is needed (only for RouteProxy)
-	if route == routing.RouteProxy && d.server.lazyInitializer != nil && !d.server.IsInitialized() {
-		// Try non-blocking initialization (will start if not already running)
-		go d.server.lazyInitializer.EnsureInitialized(context.Background())
-
-		// Hold proxy connections until initialization completes
-		logger.Info("Waiting for initialization to complete", "address", addr)
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-d.server.lazyInitializer.InitDone():
-			if err := d.server.lazyInitializer.InitError(); err != nil {
-				return nil, fmt.Errorf("initialization failed: %w", err)
-			}
-			logger.Info("Initialization complete, dialing via proxy", "address", addr)
-			// Fall through to normal proxy dial below
-		}
-	}
-
-	// Try primary route (proxy)
-	conn, err := d.dialWithRoute(ctx, network, addr, route)
-	if err == nil {
-		if route == routing.RouteProxy && d.server.idleTracker != nil {
-			d.server.idleTracker.Touch()
-		}
-		return conn, nil
-	}
-
-	// Check if fallback is needed
-	if !routing.IsFallbackableError(err) {
-		return nil, err
-	}
-
-	// Get fallback route
-	fallbackRoute := d.router.FallbackRoute(route)
-	if fallbackRoute == "" {
-		return nil, err // No fallback available
-	}
-
-	logger.Info("Fallback to alternative route",
-		"address", addr, "from", route, "to", fallbackRoute, "reason", err)
-
-	fallbackConn, fallbackErr := d.dialWithRoute(ctx, network, addr, fallbackRoute)
-	if fallbackErr == nil && fallbackRoute == routing.RouteProxy && d.server.idleTracker != nil {
-		d.server.idleTracker.Touch()
-	}
-	return fallbackConn, fallbackErr
-}
-
-func (d *directDialer) dialWithRoute(ctx context.Context, network, addr string, route routing.Route) (net.Conn, error) {
-	switch route {
-	case routing.RouteDirect:
-		// Direct connection from host
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, network, addr)
-	default:
-		// RouteProxy: use dialer if available (backend or test dialer)
-		dialer := d.server.GetDialer()
-		if dialer != nil {
-			return dialer.Dial(ctx, network, addr)
-		}
-		// Fall back to direct connection
-		var netDialer net.Dialer
-		return netDialer.DialContext(ctx, network, addr)
-	}
-}
-
-// Ensure interfaces are implemented
-var _ Manager = (*VMManager)(nil)
-var _ Manager = (*DirectManager)(nil)
+// Ensure Manager implements LazyInitializer
+var _ LazyInitializer = (*Manager)(nil)

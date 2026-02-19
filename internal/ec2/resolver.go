@@ -36,7 +36,7 @@ func (r *Resolver) ResolveByName(ctx context.Context, namePattern string) ([]Ins
 			},
 			{
 				Name:   "instance-state-name",
-				Values: []string{"running", "stopped"},
+				Values: []string{"running", "stopped", "stopping", "pending"},
 			},
 		},
 	}

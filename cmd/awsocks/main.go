@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"os/signal"
+	"runtime"
 	"sort"
 	"strings"
 	"syscall"
@@ -13,7 +14,6 @@ import (
 	"github.com/urfave/cli/v2"
 	appconfig "github.com/wadahiro/awsocks/internal/config"
 	"github.com/wadahiro/awsocks/internal/log"
-	"github.com/wadahiro/awsocks/internal/mode"
 	"github.com/wadahiro/awsocks/internal/proxy"
 	"github.com/wadahiro/awsocks/internal/routing"
 	"github.com/wadahiro/awsocks/internal/ui"
@@ -58,11 +58,16 @@ func main() {
 						Aliases: []string{"c"},
 						Usage:   "Path to config file",
 					},
-					// Execution mode
+					// Execution mode (deprecated)
 					&cli.StringFlag{
 						Name:    "mode",
 						Aliases: []string{"m"},
-						Usage:   "Execution mode (direct, vm)",
+						Usage:   "Deprecated: use --aws-api-route instead",
+						Hidden:  true,
+					},
+					&cli.StringFlag{
+						Name:  "aws-api-route",
+						Usage: "AWS API route: direct (default) or vm",
 					},
 					&cli.StringFlag{
 						Name:    "backend",
@@ -215,6 +220,11 @@ func startAction(c *cli.Context) error {
 	// Merge configurations: CLI > profile > defaults > built-in
 	merged := appconfig.Merge(&appCfg.Defaults, profile, cli)
 
+	// Deprecation warning for --mode
+	if merged.Mode == "vm" && merged.AWSAPIRoute == "vm" {
+		fmt.Println("Warning: --mode is deprecated. Use --aws-api-route instead.")
+	}
+
 	// Auto-detect SSH key if not specified
 	if merged.SSHKey == "" && (merged.InstanceID != "" || merged.Name != "") {
 		finder := appconfig.DefaultSSHKeyFinder()
@@ -239,7 +249,7 @@ func startAction(c *cli.Context) error {
 		Profile:          merged.AWSProfile,
 		Region:           merged.Region,
 		ListenAddr:       merged.Listen,
-		Mode:             mode.ParseMode(merged.Mode),
+		AWSAPIRoute:      merged.AWSAPIRoute,
 		Backend:          c.String("backend"),
 		RemotePort:       merged.RemotePort,
 		SSHUser:          merged.SSHUser,
@@ -252,10 +262,9 @@ func startAction(c *cli.Context) error {
 		IdleTimeout:      merged.IdleTimeout,
 	}
 
-	// Validate mode
-	actualMode := mode.SelectMode(cfg.Mode)
-	if actualMode == mode.ModeVM && !mode.IsVMSupported() {
-		return fmt.Errorf("VM mode is only supported on macOS")
+	// Validate VM requirements
+	if cfg.AWSAPIRoute == "vm" && runtime.GOOS != "darwin" {
+		return fmt.Errorf("aws-api-route=vm requires macOS (VM mode)")
 	}
 
 	// Validate backend-specific requirements
@@ -265,7 +274,9 @@ func startAction(c *cli.Context) error {
 
 	// Print configuration
 	fmt.Println("=== awsocks ===")
-	fmt.Printf("Mode: %s\n", actualMode)
+	if cfg.AWSAPIRoute == "vm" {
+		fmt.Println("AWS API route: vm")
+	}
 	fmt.Printf("Backend: %s\n", cfg.Backend)
 	fmt.Printf("Listen: %s\n", cfg.ListenAddr)
 	if profileName != "" {
@@ -365,7 +376,11 @@ func buildCLIFlags(c *cli.Context) *appconfig.CLIFlags {
 		cli.AutoStopIsSet = true
 	}
 	if c.IsSet("mode") {
+		// Backward compatibility: --mode vm maps to --aws-api-route vm
 		cli.Mode = c.String("mode")
+	}
+	if c.IsSet("aws-api-route") {
+		cli.AWSAPIRoute = c.String("aws-api-route")
 	}
 	if c.IsSet("listen") {
 		cli.Listen = c.String("listen")

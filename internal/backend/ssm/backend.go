@@ -66,6 +66,9 @@ type Config struct {
 	AutoStartEC2 bool          // Enable EC2 auto-start on first Dial
 	EC2Client    ec2pkg.Client // EC2 client for instance management (optional)
 
+	// Custom DialContext for WebSocket connections (nil = default)
+	DialContextFn datachannel.DialContextFunc
+
 	// Log callback (optional, for VM mode to forward logs to host)
 	LogFunc LogFunc
 }
@@ -439,10 +442,12 @@ func (b *Backend) connect() {
 // tryConnect attempts a single connection
 func (b *Backend) tryConnect() error {
 	// Create SSM session
+	b.logInfo("Starting SSM session...")
 	session, err := b.startSSMSession()
 	if err != nil {
 		return fmt.Errorf("failed to start SSM session: %w", err)
 	}
+	b.logInfo("SSM session created sessionID=%s", session.SessionID)
 
 	// Update state to handshaking
 	b.stateMu.Lock()
@@ -452,6 +457,9 @@ func (b *Backend) tryConnect() error {
 
 	// Open DataChannel
 	b.dataChannel = datachannel.NewDataChannel()
+	if b.config.DialContextFn != nil {
+		b.dataChannel.SetDialContextFn(b.config.DialContextFn)
+	}
 	b.dataChannel.SetClientVersion("1.0.0")
 
 	// Wait for handshake completion
@@ -460,9 +468,11 @@ func (b *Backend) tryConnect() error {
 		close(handshakeDone)
 	})
 
+	b.logInfo("Opening DataChannel WebSocket... streamURL=%s", session.StreamURL[:min(len(session.StreamURL), 80)])
 	if err := b.dataChannel.Open(b.ctx, session.StreamURL); err != nil {
 		return fmt.Errorf("failed to open data channel: %w", err)
 	}
+	b.logInfo("DataChannel WebSocket connected")
 
 	// Send OpenDataChannel message to authenticate (as JSON, not binary)
 	openMsg := map[string]string{
@@ -474,12 +484,13 @@ func (b *Backend) tryConnect() error {
 		b.dataChannel.Close()
 		return fmt.Errorf("failed to send open message: %w", err)
 	}
+	b.logInfo("OpenDataChannel message sent, waiting for handshake...")
 
 	// Wait for handshake or timeout
 	select {
 	case <-handshakeDone:
 		// Handshake complete
-		b.logDebug("SSM handshake complete")
+		b.logInfo("SSM handshake complete")
 	case <-time.After(30 * time.Second):
 		b.dataChannel.Close()
 		return fmt.Errorf("handshake timeout")
@@ -503,11 +514,13 @@ func (b *Backend) tryConnect() error {
 	}
 
 	// Establish SSH over the bridge (sshConn side of net.Pipe)
+	b.logInfo("Starting SSH handshake...")
 	if err := b.connectSSH(); err != nil {
 		b.cleanupDataBridge()
 		b.dataChannel.Close()
 		return fmt.Errorf("failed to connect SSH: %w", err)
 	}
+	b.logInfo("SSH connection established")
 
 	// Now that SSH is connected, set up disconnect handler for auto-reconnect
 	b.dataChannel.SetOnDisconnect(func() {
@@ -568,7 +581,6 @@ func (b *Backend) setupDataBridge(setupOutputCallback bool) error {
 func (b *Backend) setupDataChannelOutput() {
 	b.dataChannel.SetOnOutputData(func(data []byte) {
 		if b.dcConn == nil {
-			// Pipe not ready yet (during cleanup or before setup)
 			return
 		}
 		if _, err := b.dcConn.Write(data); err != nil {

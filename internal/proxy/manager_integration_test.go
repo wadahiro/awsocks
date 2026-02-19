@@ -13,14 +13,13 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
-	"github.com/wadahiro/awsocks/internal/mode"
 	"github.com/wadahiro/awsocks/internal/testutil"
 
 	"golang.org/x/net/proxy"
 )
 
-// TestIntegration_DirectManager tests DirectManager with muxssh backend
-func TestIntegration_DirectManager(t *testing.T) {
+// TestIntegration_Manager tests Manager with muxssh backend
+func TestIntegration_Manager(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -31,7 +30,6 @@ func TestIntegration_DirectManager(t *testing.T) {
 	defer cancel()
 
 	cfg := &Config{
-		Mode:       mode.ModeDirect,
 		Name:       testCfg.InstanceName,
 		Region:     testCfg.Region,
 		Profile:    testCfg.Profile,
@@ -40,7 +38,7 @@ func TestIntegration_DirectManager(t *testing.T) {
 		ListenAddr: "127.0.0.1:0", // dynamic port
 	}
 
-	mgr, err := NewDirectManager(cfg)
+	mgr, err := NewManager(cfg)
 	require.NoError(t, err)
 
 	// Start manager in background
@@ -102,8 +100,8 @@ ready:
 	t.Logf("Response: %s", string(body[:min(len(body), 200)]))
 }
 
-// TestIntegration_DirectManager_LargeResponse tests large responses through the full SOCKS5 proxy stack
-func TestIntegration_DirectManager_LargeResponse(t *testing.T) {
+// TestIntegration_Manager_LargeResponse tests large responses through the full SOCKS5 proxy stack
+func TestIntegration_Manager_LargeResponse(t *testing.T) {
 	if testing.Short() {
 		t.Skip("skipping integration test")
 	}
@@ -114,7 +112,6 @@ func TestIntegration_DirectManager_LargeResponse(t *testing.T) {
 	defer cancel()
 
 	cfg := &Config{
-		Mode:       mode.ModeDirect,
 		Name:       testCfg.InstanceName,
 		Region:     testCfg.Region,
 		Profile:    testCfg.Profile,
@@ -123,7 +120,7 @@ func TestIntegration_DirectManager_LargeResponse(t *testing.T) {
 		ListenAddr: "127.0.0.1:0",
 	}
 
-	mgr, err := NewDirectManager(cfg)
+	mgr, err := NewManager(cfg)
 	require.NoError(t, err)
 
 	errCh := make(chan error, 1)
@@ -221,7 +218,7 @@ ready:
 
 	// Test 5: Sequential requests
 	t.Run("SequentialRequests", func(t *testing.T) {
-		for i := 0; i < 5; i++ {
+		for i := range 5 {
 			resp, err := client.Get(fmt.Sprintf("http://httpbin.org/get?n=%d", i))
 			require.NoError(t, err, "request %d failed", i)
 
@@ -232,11 +229,4 @@ ready:
 			t.Logf("Request %d: %d bytes", i, len(body))
 		}
 	})
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
 }

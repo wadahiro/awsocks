@@ -1,4 +1,4 @@
-// Package agent implements the VM-side agent that handles connections and SSM sessions
+// Package agent implements the VM-side agent that handles direct connections via NAT
 package agent
 
 import (
@@ -9,59 +9,39 @@ import (
 	"sync"
 	"time"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/wadahiro/awsocks/internal/backend"
-	ssmbackend "github.com/wadahiro/awsocks/internal/backend/ssm"
 	"github.com/wadahiro/awsocks/internal/log"
 	"github.com/wadahiro/awsocks/internal/protocol"
 )
 
 var logger = log.For(log.ComponentAgent)
 
-// Agent handles communication with the host and manages SSM connections
+// Agent handles communication with the host and manages direct connections via VM NAT.
+// The agent only handles MsgConnectDirect for TCP proxy - all SSM/proxy logic is on the host side.
 type Agent struct {
-	conn          net.Conn
-	connections   map[uint32]*Connection
-	connMu        sync.RWMutex
-	connWriteMu   sync.Mutex // protects writes to conn
-	credentials   *CredentialCache
-	backend       backend.Backend
-	backendConfig *protocol.BackendConfigPayload // Backend config received from host
-	ctx           context.Context
-	cancel        context.CancelFunc
+	conn        net.Conn
+	connections map[uint32]*Connection
+	connMu      sync.RWMutex
+	connWriteMu sync.Mutex // protects writes to conn
+	ctx         context.Context
+	cancel      context.CancelFunc
 }
 
 // Connection represents an active connection being proxied
 type Connection struct {
-	ID       uint32
-	conn     net.Conn
-	agent    *Agent
-	ctx      context.Context
-	cancel   context.CancelFunc
-	closeMu  sync.Once
+	ID      uint32
+	conn    net.Conn
+	agent   *Agent
+	ctx     context.Context
+	cancel  context.CancelFunc
+	closeMu sync.Once
 }
 
 // New creates a new agent instance
-func New(vsockConn net.Conn, b backend.Backend) *Agent {
+func New(vsockConn net.Conn) *Agent {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Agent{
 		conn:        vsockConn,
 		connections: make(map[uint32]*Connection),
-		credentials: NewCredentialCache(),
-		backend:     b,
-		ctx:         ctx,
-		cancel:      cancel,
-	}
-}
-
-// NewWithoutBackend creates a new agent instance without a backend (for direct connections)
-func NewWithoutBackend(vsockConn net.Conn) *Agent {
-	ctx, cancel := context.WithCancel(context.Background())
-	return &Agent{
-		conn:        vsockConn,
-		connections: make(map[uint32]*Connection),
-		credentials: NewCredentialCache(),
 		ctx:         ctx,
 		cancel:      cancel,
 	}
@@ -89,22 +69,14 @@ func (a *Agent) Run() error {
 
 func (a *Agent) handleMessage(msg *protocol.Message) error {
 	switch msg.Type {
-	case protocol.MsgBackendConfig:
-		return a.handleBackendConfig(msg)
-	case protocol.MsgConnect:
-		return a.handleConnect(msg)
 	case protocol.MsgConnectDirect:
 		return a.handleConnectDirect(msg)
 	case protocol.MsgData:
 		return a.handleData(msg)
 	case protocol.MsgClose:
 		return a.handleClose(msg)
-	case protocol.MsgCredentialUpdate:
-		return a.handleCredentialUpdate(msg)
 	case protocol.MsgPing:
 		return a.handlePing(msg)
-	case protocol.MsgSuspend:
-		return a.handleSuspend()
 	case protocol.MsgShutdown:
 		logger.Info("Received shutdown request")
 		a.cancel()
@@ -113,21 +85,6 @@ func (a *Agent) handleMessage(msg *protocol.Message) error {
 		logger.Warn("Unknown message type", "type", msg.Type)
 		return nil
 	}
-}
-
-func (a *Agent) handleConnect(msg *protocol.Message) error {
-	network, address, err := protocol.ParseConnectPayload(msg.Payload)
-	if err != nil {
-		a.sendError(msg.ConnID, 1, err.Error())
-		return err
-	}
-
-	logger.Debug("Connect request", "network", network, "address", address, "connID", msg.ConnID)
-
-	// Handle connection asynchronously to avoid blocking the message loop
-	go a.dialAndConnect(msg.ConnID, network, address, false)
-
-	return nil
 }
 
 func (a *Agent) handleConnectDirect(msg *protocol.Message) error {
@@ -139,37 +96,17 @@ func (a *Agent) handleConnectDirect(msg *protocol.Message) error {
 
 	logger.Debug("ConnectDirect request (VM NAT)", "network", network, "address", address, "connID", msg.ConnID)
 
-	// Handle connection asynchronously with direct flag
-	go a.dialAndConnect(msg.ConnID, network, address, true)
+	go a.dialAndConnect(msg.ConnID, network, address)
 
 	return nil
 }
 
-func (a *Agent) dialAndConnect(connID uint32, network, address string, directMode bool) {
-	a.logDebug("dialAndConnect connID=%d address=%s directMode=%v hasBackend=%v", connID, address, directMode, a.backend != nil)
-
-	// Dial the target
-	// Use longer timeout to allow for SSM connection establishment (can take 30-60s)
+func (a *Agent) dialAndConnect(connID uint32, network, address string) {
 	ctx, cancel := context.WithTimeout(a.ctx, 2*time.Minute)
 	defer cancel()
 
-	var conn net.Conn
-	var err error
-	if directMode {
-		// Direct connection via VM's NAT (bypass EC2 backend)
-		a.logDebug("Using direct connection (VM NAT)")
-		var d net.Dialer
-		conn, err = d.DialContext(ctx, network, address)
-	} else if a.backend != nil {
-		// Use backend for connection (via EC2)
-		a.logDebug("Using backend for connection")
-		conn, err = a.backend.Dial(ctx, network, address)
-	} else {
-		// No backend configured, fall back to direct connection
-		a.logDebug("No backend, falling back to direct connection")
-		var d net.Dialer
-		conn, err = d.DialContext(ctx, network, address)
-	}
+	var d net.Dialer
+	conn, err := d.DialContext(ctx, network, address)
 	if err != nil {
 		a.sendError(connID, 2, err.Error())
 		logger.Debug("Failed to dial", "address", address, "connID", connID, "error", err)
@@ -234,141 +171,6 @@ func (a *Agent) handleClose(msg *protocol.Message) error {
 	return nil
 }
 
-func (a *Agent) handleSuspend() error {
-	a.logInfo("Received suspend request, closing backend without reconnect")
-
-	// Close backend (this cancels its context, preventing reconnect)
-	if a.backend != nil {
-		a.backend.Close()
-		a.backend = nil
-	}
-
-	// Close all active connections
-	a.connMu.Lock()
-	for id, c := range a.connections {
-		c.Close()
-		delete(a.connections, id)
-	}
-	a.connMu.Unlock()
-
-	// Keep backendConfig so next credential update can re-initialize
-	a.logInfo("Backend suspended, waiting for re-initialization")
-	return nil
-}
-
-func (a *Agent) handleBackendConfig(msg *protocol.Message) error {
-	a.logInfo("Received backend config")
-
-	cfg, err := protocol.ParseBackendConfigPayload(msg.Payload)
-	if err != nil {
-		return fmt.Errorf("failed to parse backend config: %w", err)
-	}
-
-	a.backendConfig = cfg
-	a.logInfo("Backend config: type=%s instance=%s region=%s user=%s lazy=%v", cfg.Type, cfg.InstanceID, cfg.Region, cfg.SSHUser, cfg.LazyConnect)
-
-	// If backend already exists and instance ID is now resolved, update the backend config
-	if a.backend != nil && cfg.InstanceID != "" {
-		if ssmBackend, ok := a.backend.(*ssmbackend.Backend); ok {
-			ssmBackend.UpdateInstanceID(cfg.InstanceID)
-			a.logInfo("Updated backend instance ID: %s", cfg.InstanceID)
-		}
-	}
-
-	// Backend will be initialized when credentials are received
-	return nil
-}
-
-func (a *Agent) handleCredentialUpdate(msg *protocol.Message) error {
-	a.logInfo("Received credential update")
-	// Parse credentials from payload
-	// Format: AccessKeyID\nSecretAccessKey\nSessionToken\nExpiration
-	creds, err := parseCredentials(msg.Payload)
-	if err != nil {
-		return fmt.Errorf("failed to parse credentials: %w", err)
-	}
-
-	a.credentials.Update(creds)
-
-	// Initialize backend if config is set but backend is not yet created
-	if a.backendConfig != nil && a.backend == nil {
-		a.logInfo("Initializing backend from credential update...")
-		if err := a.initializeBackend(creds); err != nil {
-			a.logError("Failed to initialize backend: %v", err)
-			return fmt.Errorf("failed to initialize backend: %w", err)
-		}
-	}
-
-	// Notify backend of credential update
-	if a.backend != nil {
-		// In lazy mode, just store credentials without triggering connection
-		if a.backendConfig != nil && a.backendConfig.LazyConnect {
-			a.logInfo("Lazy mode: storing credentials without connecting")
-			if setter, ok := a.backend.(interface{ SetCredentials(aws.Credentials) }); ok {
-				setter.SetCredentials(creds)
-				a.logInfo("Credentials stored (lazy mode)")
-			} else {
-				a.logError("Backend does not support SetCredentials")
-			}
-		} else {
-			// Immediate mode: trigger connection
-			a.logInfo("Immediate mode: triggering connection")
-			if err := a.backend.OnCredentialUpdate(creds); err != nil {
-				a.logError("Backend credential update failed: %v", err)
-			}
-		}
-	}
-
-	a.logInfo("Credentials updated successfully")
-	return nil
-}
-
-func (a *Agent) initializeBackend(creds aws.Credentials) error {
-	cfg := a.backendConfig
-	if cfg.Type != "muxssh" && cfg.Type != "sshproxy" {
-		return fmt.Errorf("unsupported backend type: %s", cfg.Type)
-	}
-
-	a.logInfo("Initializing MuxSSH backend...")
-
-	// Create minimal AWS config with static credentials (no LoadDefaultConfig)
-	awsCfg := aws.Config{
-		Region: cfg.Region,
-		Credentials: credentials.NewStaticCredentialsProvider(
-			creds.AccessKeyID,
-			creds.SecretAccessKey,
-			creds.SessionToken,
-		),
-	}
-
-	// Create SSM client
-	ssmClient := ssmbackend.NewHTTPClient(awsCfg)
-
-	// Create MuxSSH backend with log callback to forward logs to host
-	b := ssmbackend.New(&ssmbackend.Config{
-		InstanceID: cfg.InstanceID,
-		Region:     cfg.Region,
-		SSHUser:    cfg.SSHUser,
-		LogFunc:    a.sendLog,
-	}, ssmClient)
-
-	// Set SSH key from content
-	if err := b.SetSSHKeyContent(cfg.SSHKeyContent, cfg.SSHKeyPassphrase); err != nil {
-		a.logError("Failed to set SSH key: %v", err)
-		return fmt.Errorf("failed to set SSH key: %w", err)
-	}
-
-	// Start backend
-	if err := b.Start(a.ctx); err != nil {
-		a.logError("Failed to start backend: %v", err)
-		return fmt.Errorf("failed to start backend: %w", err)
-	}
-
-	a.backend = b
-	a.logInfo("MuxSSH backend initialized")
-	return nil
-}
-
 func (a *Agent) handlePing(msg *protocol.Message) error {
 	pong := &protocol.Message{
 		Type: protocol.MsgPong,
@@ -407,21 +209,6 @@ func (a *Agent) sendLog(level, format string, args ...interface{}) {
 	a.writeMessage(msg)
 }
 
-// logInfo sends an info log to the host
-func (a *Agent) logInfo(format string, args ...interface{}) {
-	a.sendLog("info", format, args...)
-}
-
-// logDebug sends a debug log to the host
-func (a *Agent) logDebug(format string, args ...interface{}) {
-	a.sendLog("debug", format, args...)
-}
-
-// logError sends an error log to the host
-func (a *Agent) logError(format string, args ...interface{}) {
-	a.sendLog("error", format, args...)
-}
-
 // Connection methods
 
 func (c *Connection) readLoop() {
@@ -457,39 +244,4 @@ func (c *Connection) Close() {
 		c.conn.Close()
 		c.agent.sendClose(c.ID)
 	})
-}
-
-// Credential helper functions
-
-func parseCredentials(payload []byte) (aws.Credentials, error) {
-	s := string(payload)
-	var parts []string
-	start := 0
-	for i, c := range s {
-		if c == '\n' {
-			parts = append(parts, s[start:i])
-			start = i + 1
-		}
-	}
-	parts = append(parts, s[start:])
-
-	if len(parts) < 4 {
-		return aws.Credentials{}, fmt.Errorf("invalid credential format")
-	}
-
-	var expiration time.Time
-	if parts[3] != "" && parts[3] != "0" {
-		var unix int64
-		fmt.Sscanf(parts[3], "%d", &unix)
-		if unix > 0 {
-			expiration = time.Unix(unix, 0)
-		}
-	}
-
-	return aws.Credentials{
-		AccessKeyID:     parts[0],
-		SecretAccessKey: parts[1],
-		SessionToken:    parts[2],
-		Expires:         expiration,
-	}, nil
 }

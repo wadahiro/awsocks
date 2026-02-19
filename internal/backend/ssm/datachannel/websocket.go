@@ -3,6 +3,7 @@ package datachannel
 import (
 	"context"
 	"fmt"
+	"net"
 	"net/http"
 	"sync"
 
@@ -12,13 +13,17 @@ import (
 
 var wsLogger = log.For(log.ComponentWebSocket)
 
+// DialContextFunc is a function that dials a network connection
+type DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+
 // WebSocketChannel wraps a gorilla/websocket connection
 type WebSocketChannel struct {
-	conn      *websocket.Conn
-	mu        sync.RWMutex
-	writeMu   sync.Mutex // Protects concurrent writes
-	onMessage func([]byte)
-	closed    bool
+	conn          *websocket.Conn
+	mu            sync.RWMutex
+	writeMu       sync.Mutex // Protects concurrent writes
+	onMessage     func([]byte)
+	closed        bool
+	dialContextFn DialContextFunc // Custom dial function (nil = default)
 }
 
 // NewWebSocketChannel creates a new WebSocket channel
@@ -26,11 +31,25 @@ func NewWebSocketChannel() *WebSocketChannel {
 	return &WebSocketChannel{}
 }
 
-// Open establishes a WebSocket connection
-func (w *WebSocketChannel) Open(ctx context.Context, url string) error {
-	dialer := websocket.Dialer{
+// SetDialContextFn sets a custom dial function for WebSocket connections
+func (w *WebSocketChannel) SetDialContextFn(fn DialContextFunc) {
+	w.dialContextFn = fn
+}
+
+// newDialer creates a websocket.Dialer with optional custom dial function
+func (w *WebSocketChannel) newDialer() websocket.Dialer {
+	d := websocket.Dialer{
 		HandshakeTimeout: 0, // Use context timeout
 	}
+	if w.dialContextFn != nil {
+		d.NetDialContext = w.dialContextFn
+	}
+	return d
+}
+
+// Open establishes a WebSocket connection
+func (w *WebSocketChannel) Open(ctx context.Context, url string) error {
+	dialer := w.newDialer()
 
 	conn, resp, err := dialer.DialContext(ctx, url, http.Header{})
 	if err != nil {
@@ -50,9 +69,7 @@ func (w *WebSocketChannel) Open(ctx context.Context, url string) error {
 
 // OpenWithHeaders establishes a WebSocket connection with custom headers
 func (w *WebSocketChannel) OpenWithHeaders(ctx context.Context, url string, headers http.Header) error {
-	dialer := websocket.Dialer{
-		HandshakeTimeout: 0, // Use context timeout
-	}
+	dialer := w.newDialer()
 
 	conn, resp, err := dialer.DialContext(ctx, url, headers)
 	if err != nil {

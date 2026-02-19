@@ -25,11 +25,12 @@ type CLIFlags struct {
 	AutoStopIsSet  bool
 
 	// Proxy settings
-	Mode       string
-	Listen     string
-	RemotePort int
-	Lazy       *bool
-	LazyIsSet  bool
+	Mode        string // Deprecated: use AWSAPIRoute instead
+	AWSAPIRoute string // "direct" or "vm"
+	Listen      string
+	RemotePort  int
+	Lazy        *bool
+	LazyIsSet   bool
 
 	// Routing settings
 	RouteDefault  string
@@ -50,7 +51,8 @@ type MergedConfig struct {
 	AutoStart        bool
 	AutoStop         bool
 	IdleTimeout      time.Duration
-	Mode             string
+	Mode             string // Deprecated: use AWSAPIRoute instead
+	AWSAPIRoute      string // "direct" (default) or "vm"
 	Listen           string
 	RemotePort       int
 	Lazy             bool
@@ -93,6 +95,9 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		}
 		if defaults.Mode != "" {
 			result.Mode = defaults.Mode
+		}
+		if defaults.AWSAPIRoute != "" {
+			result.AWSAPIRoute = defaults.AWSAPIRoute
 		}
 		if defaults.RemotePort != 0 {
 			result.RemotePort = defaults.RemotePort
@@ -141,6 +146,9 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		}
 		if profile.Mode != "" {
 			result.Mode = profile.Mode
+		}
+		if profile.AWSAPIRoute != "" {
+			result.AWSAPIRoute = profile.AWSAPIRoute
 		}
 		if profile.Listen != "" {
 			result.Listen = profile.Listen
@@ -196,6 +204,9 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		if cli.Mode != "" {
 			result.Mode = cli.Mode
 		}
+		if cli.AWSAPIRoute != "" {
+			result.AWSAPIRoute = cli.AWSAPIRoute
+		}
 		if cli.Listen != "" {
 			result.Listen = cli.Listen
 		}
@@ -208,6 +219,11 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 
 		// Apply CLI routing settings
 		result.Routing = mergeRoutingFromCLI(result.Routing, cli)
+	}
+
+	// Backward compatibility: migrate Mode to AWSAPIRoute if not explicitly set
+	if result.AWSAPIRoute == "" && result.Mode == "vm" {
+		result.AWSAPIRoute = "vm"
 	}
 
 	return result

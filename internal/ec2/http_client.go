@@ -26,14 +26,28 @@ type HTTPClient struct {
 	signer      *v4.Signer
 }
 
+// HTTPClientOption configures HTTPClient
+type HTTPClientOption func(*HTTPClient)
+
+// WithTransport sets a custom HTTP transport (e.g., with a custom DialContext)
+func WithTransport(t *http.Transport) HTTPClientOption {
+	return func(c *HTTPClient) {
+		c.httpClient.Transport = t
+	}
+}
+
 // NewHTTPClient creates a new HTTP-based EC2 client
-func NewHTTPClient(cfg aws.Config) *HTTPClient {
-	return &HTTPClient{
+func NewHTTPClient(cfg aws.Config, opts ...HTTPClientOption) *HTTPClient {
+	c := &HTTPClient{
 		httpClient:  &http.Client{Timeout: 30 * time.Second},
 		credentials: cfg.Credentials,
 		region:      cfg.Region,
 		signer:      v4.NewSigner(),
 	}
+	for _, opt := range opts {
+		opt(c)
+	}
+	return c
 }
 
 // DescribeInstancesInput represents the input for DescribeInstances

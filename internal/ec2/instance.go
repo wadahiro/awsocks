@@ -47,7 +47,7 @@ func (m *InstanceManager) StartAndWait(ctx context.Context, instanceID string, t
 	}
 
 	// Wait for running state
-	return m.waitForState(ctx, instanceID, "running", timeout)
+	return m.WaitForState(ctx, instanceID, "running", timeout)
 }
 
 // Stop stops an instance
@@ -64,8 +64,8 @@ func (m *InstanceManager) Stop(ctx context.Context, instanceID string) error {
 	return nil
 }
 
-// waitForState waits for an instance to reach the specified state
-func (m *InstanceManager) waitForState(ctx context.Context, instanceID string, targetState string, timeout time.Duration) error {
+// WaitForState waits for an instance to reach the specified state
+func (m *InstanceManager) WaitForState(ctx context.Context, instanceID string, targetState string, timeout time.Duration) error {
 	deadline := time.Now().Add(timeout)
 	ticker := time.NewTicker(5 * time.Second)
 	defer ticker.Stop()

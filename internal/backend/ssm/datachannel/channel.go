@@ -81,6 +81,11 @@ func NewDataChannel() *DataChannel {
 	}
 }
 
+// SetDialContextFn sets a custom dial function for WebSocket connections
+func (d *DataChannel) SetDialContextFn(fn DialContextFunc) {
+	d.ws.SetDialContextFn(fn)
+}
+
 // Open opens the data channel
 func (d *DataChannel) Open(ctx context.Context, url string) error {
 	d.mu.Lock()
@@ -326,13 +331,16 @@ func (d *DataChannel) processOutputMessage(msg *ClientMessage) error {
 	case PayloadTypeHandshakeComplete:
 		return d.handleHandshakeComplete(msg)
 	case PayloadTypeOutput:
-		d.mu.Lock()
-		defer d.mu.Unlock()
+		// Collect messages to deliver outside the lock to avoid deadlock.
+		// onOutputData may block (e.g., writing to net.Pipe) while SendInputData
+		// also needs d.mu, so holding d.mu during delivery causes deadlock.
+		var toDeliver []*ClientMessage
 
+		d.mu.Lock()
 		// Handle sequence ordering
 		if msg.SequenceNumber == d.expectedSeqNum {
 			// In order - process immediately
-			d.deliverMessage(msg)
+			toDeliver = append(toDeliver, msg)
 			d.expectedSeqNum++
 
 			// Process any buffered messages
@@ -341,7 +349,7 @@ func (d *DataChannel) processOutputMessage(msg *ClientMessage) error {
 				if !ok {
 					break
 				}
-				d.deliverMessage(buffered)
+				toDeliver = append(toDeliver, buffered)
 				delete(d.incomingBuffer, d.expectedSeqNum)
 				d.expectedSeqNum++
 			}
@@ -350,6 +358,12 @@ func (d *DataChannel) processOutputMessage(msg *ClientMessage) error {
 			d.incomingBuffer[msg.SequenceNumber] = msg
 		}
 		// Duplicate (seq < expected) - ignore
+		d.mu.Unlock()
+
+		// Deliver messages outside the lock
+		for _, m := range toDeliver {
+			d.deliverMessage(m)
+		}
 	default:
 		// Unhandled payload type - ignore
 	}
@@ -456,10 +470,17 @@ func (d *DataChannel) sendAcknowledge(msg *ClientMessage) error {
 	return nil
 }
 
-// deliverMessage delivers a message to the output handler
+// deliverMessage delivers a message to the output handler.
+// Must be called WITHOUT d.mu held to avoid deadlock with SendInputData.
 func (d *DataChannel) deliverMessage(msg *ClientMessage) {
-	if d.onOutputData != nil && msg.PayloadType == PayloadTypeOutput {
-		d.onOutputData(msg.Payload)
+	if msg.PayloadType != PayloadTypeOutput {
+		return
+	}
+	d.mu.RLock()
+	onOutput := d.onOutputData
+	d.mu.RUnlock()
+	if onOutput != nil {
+		onOutput(msg.Payload)
 	}
 }
 

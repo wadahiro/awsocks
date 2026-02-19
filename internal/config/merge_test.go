@@ -318,6 +318,61 @@ func TestMerge_IdleTimeout(t *testing.T) {
 	}
 }
 
+func TestMerge_AWSAPIRoute(t *testing.T) {
+	tests := []struct {
+		name             string
+		defaultsRoute    string
+		profileRoute     string
+		cliRoute         string
+		mode             string
+		expectedRoute    string
+	}{
+		{
+			name:          "CLI overrides profile",
+			profileRoute:  "vm",
+			cliRoute:      "direct",
+			expectedRoute: "direct",
+		},
+		{
+			name:          "profile overrides defaults",
+			defaultsRoute: "direct",
+			profileRoute:  "vm",
+			expectedRoute: "vm",
+		},
+		{
+			name:          "defaults applied",
+			defaultsRoute: "vm",
+			expectedRoute: "vm",
+		},
+		{
+			name:          "empty by default",
+			expectedRoute: "",
+		},
+		{
+			name:          "mode=vm migrated to aws-api-route=vm",
+			mode:          "vm",
+			expectedRoute: "vm",
+		},
+		{
+			name:          "explicit aws-api-route takes precedence over mode migration",
+			mode:          "vm",
+			cliRoute:      "direct",
+			expectedRoute: "direct",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defaults := &Defaults{AWSAPIRoute: tt.defaultsRoute}
+			profile := &Profile{AWSAPIRoute: tt.profileRoute}
+			cli := &CLIFlags{AWSAPIRoute: tt.cliRoute, Mode: tt.mode}
+
+			result := Merge(defaults, profile, cli)
+			assert.Equal(t, tt.expectedRoute, result.AWSAPIRoute)
+		})
+	}
+}
+
 func TestMerge_SSHKeyPassphrase(t *testing.T) {
 	profile := &Profile{
 		SSHKeyPassphrase: "profile-pass",
