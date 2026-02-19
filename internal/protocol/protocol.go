@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
-	"time"
 )
 
 // MessageType defines the type of message
@@ -14,24 +13,16 @@ type MessageType byte
 
 const (
 	// Connection management
-	MsgConnect       MessageType = 0x01 // Deprecated: proxy connections are now handled on the host side
 	MsgConnectAck    MessageType = 0x02
 	MsgData          MessageType = 0x03
 	MsgClose         MessageType = 0x04
 	MsgError         MessageType = 0x05
 	MsgConnectDirect MessageType = 0x06 // VM NAT direct connection (bypass EC2)
 
-	// Credential management
-	MsgCredentialUpdate MessageType = 0x10 // Deprecated: credentials are now managed on the host side
-
 	// Control messages
 	MsgPing     MessageType = 0x20
 	MsgPong     MessageType = 0x21
 	MsgShutdown MessageType = 0x22
-	MsgSuspend  MessageType = 0x23 // Deprecated: suspend/resume is now handled on the host side
-
-	// Backend configuration
-	MsgBackendConfig MessageType = 0x30 // Deprecated: backend configuration is now on the host side
 
 	// Agent log forwarding
 	MsgLog MessageType = 0x40
@@ -42,37 +33,6 @@ type Message struct {
 	Type    MessageType
 	ConnID  uint32
 	Payload []byte
-}
-
-// ConnectPayload contains connection request details
-type ConnectPayload struct {
-	Network string // "tcp" or "udp"
-	Address string // host:port
-}
-
-// CredentialPayload contains AWS credentials
-type CredentialPayload struct {
-	AccessKeyID     string
-	SecretAccessKey string
-	SessionToken    string
-	Expiration      time.Time
-}
-
-// ErrorPayload contains error details
-type ErrorPayload struct {
-	Code    int
-	Message string
-}
-
-// BackendConfigPayload contains backend configuration
-type BackendConfigPayload struct {
-	Type             string `json:"type"`             // "muxssh"
-	InstanceID       string `json:"instanceId"`
-	Region           string `json:"region"`
-	SSHUser          string `json:"sshUser"`
-	SSHKeyContent    []byte `json:"sshKeyContent"`    // SSH private key bytes
-	SSHKeyPassphrase string `json:"sshKeyPassphrase"` // Optional passphrase
-	LazyConnect      bool   `json:"lazyConnect"`      // Lazy connection mode
 }
 
 // Encode serializes a message for transmission
@@ -134,16 +94,6 @@ func WriteMessage(w io.Writer, m *Message) error {
 	return err
 }
 
-// NewConnectMessage creates a connection request message
-func NewConnectMessage(connID uint32, network, address string) *Message {
-	payload := []byte(fmt.Sprintf("%s:%s", network, address))
-	return &Message{
-		Type:    MsgConnect,
-		ConnID:  connID,
-		Payload: payload,
-	}
-}
-
 // NewConnectDirectMessage creates a direct connection request message (VM NAT, bypass EC2)
 func NewConnectDirectMessage(connID uint32, network, address string) *Message {
 	payload := []byte(fmt.Sprintf("%s:%s", network, address))
@@ -181,21 +131,6 @@ func NewErrorMessage(connID uint32, code int, message string) *Message {
 	}
 }
 
-// NewCredentialUpdateMessage creates a credential update message
-func NewCredentialUpdateMessage(creds CredentialPayload) *Message {
-	// Simple encoding: fields separated by newlines
-	payload := fmt.Sprintf("%s\n%s\n%s\n%d",
-		creds.AccessKeyID,
-		creds.SecretAccessKey,
-		creds.SessionToken,
-		creds.Expiration.Unix(),
-	)
-	return &Message{
-		Type:    MsgCredentialUpdate,
-		Payload: []byte(payload),
-	}
-}
-
 // ParseConnectPayload parses a connect message payload
 func ParseConnectPayload(payload []byte) (network, address string, err error) {
 	s := string(payload)
@@ -205,24 +140,6 @@ func ParseConnectPayload(payload []byte) (network, address string, err error) {
 		}
 	}
 	return "", "", fmt.Errorf("invalid connect payload: %s", s)
-}
-
-// NewBackendConfigMessage creates a backend configuration message
-func NewBackendConfigMessage(cfg *BackendConfigPayload) *Message {
-	payload, _ := json.Marshal(cfg)
-	return &Message{
-		Type:    MsgBackendConfig,
-		Payload: payload,
-	}
-}
-
-// ParseBackendConfigPayload parses a backend config message payload
-func ParseBackendConfigPayload(payload []byte) (*BackendConfigPayload, error) {
-	var cfg BackendConfigPayload
-	if err := json.Unmarshal(payload, &cfg); err != nil {
-		return nil, fmt.Errorf("failed to parse backend config: %w", err)
-	}
-	return &cfg, nil
 }
 
 // LogPayload contains log message from agent
@@ -252,8 +169,6 @@ func ParseLogPayload(payload []byte) (*LogPayload, error) {
 // String returns a human-readable message type name
 func (t MessageType) String() string {
 	switch t {
-	case MsgConnect:
-		return "Connect"
 	case MsgConnectAck:
 		return "ConnectAck"
 	case MsgData:
@@ -264,18 +179,12 @@ func (t MessageType) String() string {
 		return "Error"
 	case MsgConnectDirect:
 		return "ConnectDirect"
-	case MsgCredentialUpdate:
-		return "CredentialUpdate"
 	case MsgPing:
 		return "Ping"
 	case MsgPong:
 		return "Pong"
 	case MsgShutdown:
 		return "Shutdown"
-	case MsgSuspend:
-		return "Suspend"
-	case MsgBackendConfig:
-		return "BackendConfig"
 	case MsgLog:
 		return "Log"
 	default:

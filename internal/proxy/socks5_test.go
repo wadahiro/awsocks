@@ -128,7 +128,7 @@ func mockAgent(t *testing.T, conn net.Conn) {
 			return
 		}
 		switch msg.Type {
-		case protocol.MsgConnect, protocol.MsgConnectDirect:
+		case protocol.MsgConnectDirect:
 			ack := &protocol.Message{
 				Type:   protocol.MsgConnectAck,
 				ConnID: msg.ConnID,
