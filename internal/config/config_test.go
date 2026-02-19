@@ -156,7 +156,7 @@ ssh-user = "ubuntu"
 ssh-key-passphrase = "secret"
 auto-start = true
 auto-stop = true
-aws-api-route = "direct"
+proxy-network = "direct"
 listen = "0.0.0.0:8080"
 remote-port = 2222
 lazy = false
@@ -178,7 +178,7 @@ lazy = false
 	assert.Equal(t, "secret", full.SSHKeyPassphrase)
 	assert.True(t, full.AutoStart)
 	assert.True(t, full.AutoStop)
-	assert.Equal(t, "direct", full.AWSAPIRoute)
+	assert.Equal(t, "direct", full.ProxyNetwork)
 	assert.Equal(t, "0.0.0.0:8080", full.Listen)
 	assert.Equal(t, 2222, full.RemotePort)
 	require.NotNil(t, full.Lazy)

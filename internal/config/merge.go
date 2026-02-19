@@ -25,7 +25,7 @@ type CLIFlags struct {
 	AutoStopIsSet  bool
 
 	// Proxy settings
-	AWSAPIRoute string // "direct" or "vm"
+	ProxyNetwork string // "direct" or "vm"
 	Listen      string
 	RemotePort  int
 	Lazy        *bool
@@ -50,7 +50,7 @@ type MergedConfig struct {
 	AutoStart        bool
 	AutoStop         bool
 	IdleTimeout      time.Duration
-	AWSAPIRoute      string // "direct" (default) or "vm"
+	ProxyNetwork     string // "direct" (default) or "vm"
 	Listen           string
 	RemotePort       int
 	Lazy             bool
@@ -89,8 +89,8 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		if defaults.Listen != "" {
 			result.Listen = defaults.Listen
 		}
-		if defaults.AWSAPIRoute != "" {
-			result.AWSAPIRoute = defaults.AWSAPIRoute
+		if defaults.ProxyNetwork != "" {
+			result.ProxyNetwork = defaults.ProxyNetwork
 		}
 		if defaults.RemotePort != 0 {
 			result.RemotePort = defaults.RemotePort
@@ -137,8 +137,8 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		if profile.AutoStop {
 			result.AutoStop = true
 		}
-		if profile.AWSAPIRoute != "" {
-			result.AWSAPIRoute = profile.AWSAPIRoute
+		if profile.ProxyNetwork != "" {
+			result.ProxyNetwork = profile.ProxyNetwork
 		}
 		if profile.Listen != "" {
 			result.Listen = profile.Listen
@@ -191,8 +191,8 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		if cli.AutoStopIsSet {
 			result.AutoStop = cli.AutoStop
 		}
-		if cli.AWSAPIRoute != "" {
-			result.AWSAPIRoute = cli.AWSAPIRoute
+		if cli.ProxyNetwork != "" {
+			result.ProxyNetwork = cli.ProxyNetwork
 		}
 		if cli.Listen != "" {
 			result.Listen = cli.Listen

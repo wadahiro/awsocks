@@ -38,7 +38,7 @@ type Profile struct {
 	IdleTimeout string `toml:"idle-timeout"` // e.g., "30m", "1h"
 
 	// Proxy settings
-	AWSAPIRoute string `toml:"aws-api-route"` // "direct" (default) or "vm"
+	ProxyNetwork string `toml:"proxy-network"` // "direct" (default) or "vm"
 	Listen      string `toml:"listen"`
 	RemotePort  int    `toml:"remote-port"`
 	Lazy        *bool  `toml:"lazy"`
@@ -51,7 +51,7 @@ type Profile struct {
 type Defaults struct {
 	SSHUser     string `toml:"ssh-user"`
 	Listen      string `toml:"listen"`
-	AWSAPIRoute string `toml:"aws-api-route"` // "direct" (default) or "vm"
+	ProxyNetwork string `toml:"proxy-network"` // "direct" (default) or "vm"
 	RemotePort  int    `toml:"remote-port"`
 	Lazy        *bool  `toml:"lazy"`
 	IdleTimeout string `toml:"idle-timeout"` // e.g., "30m", "1h"

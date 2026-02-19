@@ -48,8 +48,8 @@ type Config struct {
 	// Idle timeout settings
 	IdleTimeout time.Duration
 
-	// AWS API route: "direct" (default) or "vm"
-	AWSAPIRoute string
+	// Proxy network: "direct" (default) or "vm"
+	ProxyNetwork string
 }
 
 // Dialer is an interface for dialing connections (subset of backend.Backend)
@@ -106,7 +106,7 @@ func (m *Manager) Start(ctx context.Context) error {
 	needsProxy := m.needsProxy()
 
 	if needsVM {
-		logger.Info("VM required (vm-direct routes or aws-api-route=vm)")
+		logger.Info("VM required (vm-direct routes or proxy-network=vm)")
 	}
 	if needsProxy {
 		logger.Info("Proxy required (instance configured)")
@@ -166,8 +166,8 @@ func (m *Manager) Start(ctx context.Context) error {
 
 // needsVM determines if a VM should be started
 func (m *Manager) needsVM() bool {
-	// VM needed if aws-api-route=vm
-	if m.cfg.AWSAPIRoute == "vm" {
+	// VM needed if proxy-network=vm
+	if m.cfg.ProxyNetwork == "vm" {
 		return true
 	}
 
@@ -191,7 +191,7 @@ func (m *Manager) createRouter() routing.Router {
 	if m.cfg.RoutingConfig != nil && len(m.cfg.RoutingConfig.VMDirect) > 0 {
 		hasVMDirect = true
 	}
-	needsVM := m.cfg.AWSAPIRoute == "vm" || hasVMDirect
+	needsVM := m.cfg.ProxyNetwork == "vm" || hasVMDirect
 
 	var opts []routing.RouterOption
 	if needsVM {
@@ -262,13 +262,13 @@ func (m *Manager) initializeProxy(ctx context.Context) error {
 
 	awsCfg := m.credProv.GetConfig()
 
-	// Determine dial function based on aws-api-route
+	// Determine dial function based on proxy-network
 	var dialFn awsapi.DialContextFunc
-	if m.cfg.AWSAPIRoute == "vm" && m.agentMux != nil {
+	if m.cfg.ProxyNetwork == "vm" && m.agentMux != nil {
 		dialFn = awsapi.NewVsockDialer(m.agentMux)
-		logger.Info("AWS API route: vm (via VM NAT)")
+		logger.Info("Proxy network: vm (via VM NAT)")
 	} else {
-		logger.Info("AWS API route: direct")
+		logger.Info("Proxy network: direct")
 	}
 
 	// Create unified AWS client

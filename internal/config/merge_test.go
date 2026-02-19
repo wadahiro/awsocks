@@ -315,7 +315,7 @@ func TestMerge_IdleTimeout(t *testing.T) {
 	}
 }
 
-func TestMerge_AWSAPIRoute(t *testing.T) {
+func TestMerge_ProxyNetwork(t *testing.T) {
 	tests := []struct {
 		name             string
 		defaultsRoute    string
@@ -348,12 +348,12 @@ func TestMerge_AWSAPIRoute(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			defaults := &Defaults{AWSAPIRoute: tt.defaultsRoute}
-			profile := &Profile{AWSAPIRoute: tt.profileRoute}
-			cli := &CLIFlags{AWSAPIRoute: tt.cliRoute}
+			defaults := &Defaults{ProxyNetwork: tt.defaultsRoute}
+			profile := &Profile{ProxyNetwork: tt.profileRoute}
+			cli := &CLIFlags{ProxyNetwork: tt.cliRoute}
 
 			result := Merge(defaults, profile, cli)
-			assert.Equal(t, tt.expectedRoute, result.AWSAPIRoute)
+			assert.Equal(t, tt.expectedRoute, result.ProxyNetwork)
 		})
 	}
 }

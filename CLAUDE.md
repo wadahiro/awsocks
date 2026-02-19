@@ -49,12 +49,12 @@ Follow Test-Driven Development:
 
 Run tests frequently: `make test-unit`
 
-## AWS API Route
+## Proxy Network
 
 | Route | Flag | Description |
 |-------|------|-------------|
-| direct | default | Host calls AWS APIs directly |
-| vm | `--aws-api-route vm` | AWS APIs routed through VM NAT |
+| direct | default | Proxy directly from host |
+| vm | `--proxy-network vm` | Proxy via VM (Virtualization.framework) |
 
 ## Routing
 

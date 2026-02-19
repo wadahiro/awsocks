@@ -59,8 +59,8 @@ func main() {
 						Usage:   "Path to config file",
 					},
 					&cli.StringFlag{
-						Name:  "aws-api-route",
-						Usage: "AWS API route: direct (default) or vm",
+						Name:  "proxy-network",
+						Usage: "Proxy network: direct (default) or vm",
 					},
 					&cli.StringFlag{
 						Name:    "backend",
@@ -231,7 +231,7 @@ func startAction(c *cli.Context) error {
 		Profile:          merged.AWSProfile,
 		Region:           merged.Region,
 		ListenAddr:       merged.Listen,
-		AWSAPIRoute:      merged.AWSAPIRoute,
+		ProxyNetwork:      merged.ProxyNetwork,
 		Backend:          c.String("backend"),
 		RemotePort:       merged.RemotePort,
 		SSHUser:          merged.SSHUser,
@@ -245,8 +245,8 @@ func startAction(c *cli.Context) error {
 	}
 
 	// Validate VM requirements
-	if cfg.AWSAPIRoute == "vm" && runtime.GOOS != "darwin" {
-		return fmt.Errorf("aws-api-route=vm requires macOS (VM mode)")
+	if cfg.ProxyNetwork == "vm" && runtime.GOOS != "darwin" {
+		return fmt.Errorf("proxy-network=vm requires macOS (VM mode)")
 	}
 
 	// Validate backend-specific requirements
@@ -256,8 +256,8 @@ func startAction(c *cli.Context) error {
 
 	// Print configuration
 	fmt.Println("=== awsocks ===")
-	if cfg.AWSAPIRoute == "vm" {
-		fmt.Println("AWS API route: vm")
+	if cfg.ProxyNetwork == "vm" {
+		fmt.Println("Proxy network: vm")
 	}
 	fmt.Printf("Backend: %s\n", cfg.Backend)
 	fmt.Printf("Listen: %s\n", cfg.ListenAddr)
@@ -357,8 +357,8 @@ func buildCLIFlags(c *cli.Context) *appconfig.CLIFlags {
 		cli.AutoStop = c.Bool("auto-stop")
 		cli.AutoStopIsSet = true
 	}
-	if c.IsSet("aws-api-route") {
-		cli.AWSAPIRoute = c.String("aws-api-route")
+	if c.IsSet("proxy-network") {
+		cli.ProxyNetwork = c.String("proxy-network")
 	}
 	if c.IsSet("listen") {
 		cli.Listen = c.String("listen")

@@ -116,7 +116,7 @@ proxy = ["*.internal.example.com", "*.staging.example.com"]
 | `ssh-user` | `ec2-user` | SSH username on EC2 |
 | `listen` | `127.0.0.1:1080` | SOCKS5 listen address |
 | `lazy` | `true` | Defer AWS connection until first request |
-| `aws-api-route` | `direct` | AWS API route (`direct` or `vm`) |
+| `proxy-network` | `direct` | Proxy network (`direct` or `vm`) |
 | `idle-timeout` | (none) | Suspend EC2 instance after idle period (e.g., `30m`, `1h`) |
 
 ### Routing
@@ -152,7 +152,7 @@ awsocks start [profile] [flags]
 | `--route-proxy` | Patterns to route via proxy |
 | `--route-direct` | Patterns to route directly |
 | `--lazy` | Enable lazy connection mode |
-| `--aws-api-route` | AWS API route (direct/vm) |
+| `--proxy-network` | Proxy network (direct/vm) |
 | `--idle-timeout` | Suspend EC2 after idle period |
 
 ## Prerequisites
