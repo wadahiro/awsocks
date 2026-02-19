@@ -132,7 +132,7 @@ func (c *Client) WaitForSSMAgent(ctx context.Context, instanceID string, timeout
 				logger.Info("SSM agent is now online", "instance", instanceID)
 				return nil
 			}
-			logger.Debug("SSM agent not ready yet", "pingStatus", output.PingStatus, "instance", instanceID)
+			logger.Info("Waiting for SSM agent", "instance", instanceID, "pingStatus", output.PingStatus)
 		}
 	}
 }
