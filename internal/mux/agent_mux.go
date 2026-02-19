@@ -181,7 +181,7 @@ func (m *AgentMux) handleConnectAck(msg *protocol.Message) {
 	m.pendingMu.Unlock()
 
 	if !ok {
-		logger.Warn("ConnectAck for unknown connection", "connID", msg.ConnID)
+		logger.Debug("ConnectAck for timed-out connection", "connID", msg.ConnID)
 		return
 	}
 

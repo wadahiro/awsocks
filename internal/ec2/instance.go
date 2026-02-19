@@ -4,7 +4,11 @@ import (
 	"context"
 	"fmt"
 	"time"
+
+	"github.com/wadahiro/awsocks/internal/log"
 )
+
+var logger = log.For(log.ComponentEC2)
 
 // InstanceManager manages EC2 instance lifecycle
 type InstanceManager struct {
@@ -88,7 +92,7 @@ func (m *InstanceManager) WaitForState(ctx context.Context, instanceID string, t
 				return nil
 			}
 
-			fmt.Printf("[ec2] Instance %s is %s, waiting for %s...\n", instanceID, state, targetState)
+			logger.Info("Waiting for instance state", "instance", instanceID, "current", state, "target", targetState)
 		}
 	}
 }
