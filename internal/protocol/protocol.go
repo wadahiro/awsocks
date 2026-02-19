@@ -28,6 +28,7 @@ const (
 	MsgPing     MessageType = 0x20
 	MsgPong     MessageType = 0x21
 	MsgShutdown MessageType = 0x22
+	MsgSuspend  MessageType = 0x23 // Idle suspend: close backend without reconnect
 
 	// Backend configuration
 	MsgBackendConfig MessageType = 0x30
@@ -271,6 +272,8 @@ func (t MessageType) String() string {
 		return "Pong"
 	case MsgShutdown:
 		return "Shutdown"
+	case MsgSuspend:
+		return "Suspend"
 	case MsgBackendConfig:
 		return "BackendConfig"
 	case MsgLog:

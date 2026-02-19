@@ -185,6 +185,69 @@ lazy = false
 	assert.False(t, *full.Lazy)
 }
 
+func TestLoadConfig_IdleTimeout(t *testing.T) {
+	tests := []struct {
+		name     string
+		toml     string
+		wantDef  string
+		wantProf string
+	}{
+		{
+			name: "defaults only",
+			toml: `
+[defaults]
+idle-timeout = "30m"
+
+[profiles.work]
+name = "bastion"
+`,
+			wantDef:  "30m",
+			wantProf: "",
+		},
+		{
+			name: "profile only",
+			toml: `
+[profiles.work]
+name = "bastion"
+idle-timeout = "1h"
+`,
+			wantDef:  "",
+			wantProf: "1h",
+		},
+		{
+			name: "both defaults and profile",
+			toml: `
+[defaults]
+idle-timeout = "30m"
+
+[profiles.work]
+name = "bastion"
+idle-timeout = "1h"
+`,
+			wantDef:  "30m",
+			wantProf: "1h",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			tmpDir := t.TempDir()
+			configPath := filepath.Join(tmpDir, "config.toml")
+			require.NoError(t, os.WriteFile(configPath, []byte(tt.toml), 0644))
+
+			cfg, err := LoadConfig(configPath)
+			require.NoError(t, err)
+
+			assert.Equal(t, tt.wantDef, cfg.Defaults.IdleTimeout)
+
+			if tt.wantProf != "" {
+				work := cfg.Profiles["work"]
+				assert.Equal(t, tt.wantProf, work.IdleTimeout)
+			}
+		})
+	}
+}
+
 func TestLoadConfig_RoutingConfig(t *testing.T) {
 	content := `
 [defaults.routing]

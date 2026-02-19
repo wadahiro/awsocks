@@ -26,6 +26,7 @@ type Provider struct {
 	watcher         *fsnotify.Watcher
 	lastCreds       aws.Credentials
 	lastCredsTime   time.Time
+	lastConfig      *aws.Config
 	mu              sync.RWMutex
 	retryInterval   time.Duration
 	expiryBuffer    time.Duration
@@ -233,8 +234,9 @@ func (p *Provider) loadAndSend(ctx context.Context) error {
 		return fmt.Errorf("failed to retrieve credentials: %w", err)
 	}
 
-	// Store last credentials for expiry tracking
+	// Store last config and credentials for reuse
 	p.mu.Lock()
+	p.lastConfig = &cfg
 	p.lastCreds = creds
 	p.lastCredsTime = time.Now()
 	p.mu.Unlock()
@@ -267,8 +269,22 @@ func (p *Provider) RefreshChannel() <-chan aws.Credentials {
 	return p.refreshCh
 }
 
-// GetCredentials retrieves current credentials
+// GetCredentials retrieves current credentials from cache, falling back to a fresh load
 func (p *Provider) GetCredentials(ctx context.Context) (aws.Credentials, error) {
+	p.mu.RLock()
+	creds := p.lastCreds
+	p.mu.RUnlock()
+
+	if creds.HasKeys() {
+		return creds, nil
+	}
+
+	// Fallback: load fresh credentials if cache is empty
+	return p.loadCredentials(ctx)
+}
+
+// loadCredentials loads credentials from AWS config (used as fallback when cache is empty)
+func (p *Provider) loadCredentials(ctx context.Context) (aws.Credentials, error) {
 	opts := []func(*config.LoadOptions) error{}
 
 	if p.profile != "" {
@@ -302,6 +318,13 @@ func (p *Provider) RequestRefresh(ctx context.Context) {
 			logger.Error("Requested refresh failed", "error", err)
 		}
 	}()
+}
+
+// GetConfig returns the last loaded AWS config (cached from loadAndSend)
+func (p *Provider) GetConfig() *aws.Config {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.lastConfig
 }
 
 // GetLastCredentials returns the last loaded credentials

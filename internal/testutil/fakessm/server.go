@@ -219,3 +219,11 @@ func (s *Server) TerminateSession(ctx context.Context, input *ssmbackend.Termina
 		SessionId: input.SessionId,
 	}, nil
 }
+
+// DescribeInstanceInformation implements the SSMClient interface for testing.
+// Always returns Online status by default.
+func (s *Server) DescribeInstanceInformation(ctx context.Context, input *ssmbackend.DescribeInstanceInformationInput) (*ssmbackend.DescribeInstanceInformationOutput, error) {
+	return &ssmbackend.DescribeInstanceInformationOutput{
+		PingStatus: "Online",
+	}, nil
+}

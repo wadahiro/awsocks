@@ -23,3 +23,13 @@ type TerminateSessionInput struct {
 type TerminateSessionOutput struct {
 	SessionId string
 }
+
+// DescribeInstanceInformationInput represents the input for SSM DescribeInstanceInformation API
+type DescribeInstanceInformationInput struct {
+	InstanceID string
+}
+
+// DescribeInstanceInformationOutput represents the output from SSM DescribeInstanceInformation API
+type DescribeInstanceInformationOutput struct {
+	PingStatus string // "Online", "ConnectionLost", "Inactive"
+}

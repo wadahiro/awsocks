@@ -17,6 +17,30 @@ type MockSSMClient struct {
 	mock.Mock
 }
 
+func (m *MockSSMClient) StartSession(ctx context.Context, input *StartSessionInput) (*StartSessionOutput, error) {
+	args := m.Called(ctx, input)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*StartSessionOutput), args.Error(1)
+}
+
+func (m *MockSSMClient) TerminateSession(ctx context.Context, input *TerminateSessionInput) (*TerminateSessionOutput, error) {
+	args := m.Called(ctx, input)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*TerminateSessionOutput), args.Error(1)
+}
+
+func (m *MockSSMClient) DescribeInstanceInformation(ctx context.Context, input *DescribeInstanceInformationInput) (*DescribeInstanceInformationOutput, error) {
+	args := m.Called(ctx, input)
+	if args.Get(0) == nil {
+		return nil, args.Error(1)
+	}
+	return args.Get(0).(*DescribeInstanceInformationOutput), args.Error(1)
+}
+
 func TestBackend_Name(t *testing.T) {
 	cfg := &Config{
 		InstanceID: "i-12345678",
@@ -189,4 +213,123 @@ func TestBackend_SetSSHKeyContent_InvalidKey(t *testing.T) {
 	err := backend.SetSSHKeyContent([]byte("invalid key"), "")
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "failed to parse SSH key")
+}
+
+func TestWaitForSSMAgent_AlreadyOnline(t *testing.T) {
+	// Use short poll interval for tests
+	origInterval := ssmAgentPollInterval
+	ssmAgentPollInterval = 50 * time.Millisecond
+	t.Cleanup(func() { ssmAgentPollInterval = origInterval })
+	mockClient := new(MockSSMClient)
+	cfg := &Config{
+		InstanceID: "i-12345678",
+		Region:     "ap-northeast-1",
+	}
+
+	b := New(cfg, mockClient)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b.ctx = ctx
+
+	mockClient.On("DescribeInstanceInformation", mock.Anything, &DescribeInstanceInformationInput{
+		InstanceID: "i-12345678",
+	}).Return(&DescribeInstanceInformationOutput{
+		PingStatus: "Online",
+	}, nil).Once()
+
+	err := b.waitForSSMAgent()
+	assert.NoError(t, err)
+	mockClient.AssertExpectations(t)
+}
+
+func TestWaitForSSMAgent_BecomesOnline(t *testing.T) {
+	origInterval := ssmAgentPollInterval
+	ssmAgentPollInterval = 50 * time.Millisecond
+	t.Cleanup(func() { ssmAgentPollInterval = origInterval })
+	mockClient := new(MockSSMClient)
+	cfg := &Config{
+		InstanceID: "i-12345678",
+		Region:     "ap-northeast-1",
+	}
+
+	b := New(cfg, mockClient)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b.ctx = ctx
+
+	// First call: not yet online (empty = instance not found in SSM)
+	mockClient.On("DescribeInstanceInformation", mock.Anything, &DescribeInstanceInformationInput{
+		InstanceID: "i-12345678",
+	}).Return(&DescribeInstanceInformationOutput{
+		PingStatus: "",
+	}, nil).Once()
+
+	// Second call: online
+	mockClient.On("DescribeInstanceInformation", mock.Anything, &DescribeInstanceInformationInput{
+		InstanceID: "i-12345678",
+	}).Return(&DescribeInstanceInformationOutput{
+		PingStatus: "Online",
+	}, nil).Once()
+
+	err := b.waitForSSMAgent()
+	assert.NoError(t, err)
+	mockClient.AssertExpectations(t)
+}
+
+func TestWaitForSSMAgent_Timeout(t *testing.T) {
+	origInterval := ssmAgentPollInterval
+	ssmAgentPollInterval = 50 * time.Millisecond
+	t.Cleanup(func() { ssmAgentPollInterval = origInterval })
+	mockClient := new(MockSSMClient)
+	cfg := &Config{
+		InstanceID: "i-12345678",
+		Region:     "ap-northeast-1",
+	}
+
+	b := New(cfg, mockClient)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b.ctx = ctx
+
+	// Always return not online
+	mockClient.On("DescribeInstanceInformation", mock.Anything, &DescribeInstanceInformationInput{
+		InstanceID: "i-12345678",
+	}).Return(&DescribeInstanceInformationOutput{
+		PingStatus: "ConnectionLost",
+	}, nil)
+
+	err := b.waitForSSMAgentWithTimeout(500 * time.Millisecond)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "timeout")
+}
+
+func TestWaitForSSMAgent_ContextCancelled(t *testing.T) {
+	origInterval := ssmAgentPollInterval
+	ssmAgentPollInterval = 50 * time.Millisecond
+	t.Cleanup(func() { ssmAgentPollInterval = origInterval })
+	mockClient := new(MockSSMClient)
+	cfg := &Config{
+		InstanceID: "i-12345678",
+		Region:     "ap-northeast-1",
+	}
+
+	b := New(cfg, mockClient)
+	ctx, cancel := context.WithCancel(context.Background())
+	b.ctx = ctx
+
+	// Always return not online
+	mockClient.On("DescribeInstanceInformation", mock.Anything, &DescribeInstanceInformationInput{
+		InstanceID: "i-12345678",
+	}).Return(&DescribeInstanceInformationOutput{
+		PingStatus: "",
+	}, nil).Maybe()
+
+	// Cancel context after a short delay
+	go func() {
+		time.Sleep(100 * time.Millisecond)
+		cancel()
+	}()
+
+	err := b.waitForSSMAgentWithTimeout(2 * time.Minute)
+	assert.Error(t, err)
 }

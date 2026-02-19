@@ -249,6 +249,7 @@ func startAction(c *cli.Context) error {
 		AutoStop:         merged.AutoStop,
 		RoutingConfig:    routingCfg,
 		LazyConnect:      merged.Lazy,
+		IdleTimeout:      merged.IdleTimeout,
 	}
 
 	// Validate mode
@@ -291,6 +292,9 @@ func startAction(c *cli.Context) error {
 	}
 	if !cfg.LazyConnect {
 		fmt.Println("Lazy: disabled")
+	}
+	if cfg.IdleTimeout > 0 {
+		fmt.Printf("Idle timeout: %s\n", cfg.IdleTimeout)
 	}
 	fmt.Println()
 

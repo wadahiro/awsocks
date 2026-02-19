@@ -79,6 +79,36 @@ func (c *HTTPClient) TerminateSession(ctx context.Context, input *TerminateSessi
 	}, nil
 }
 
+// DescribeInstanceInformation calls the SSM DescribeInstanceInformation API
+func (c *HTTPClient) DescribeInstanceInformation(ctx context.Context, input *DescribeInstanceInformationInput) (*DescribeInstanceInformationOutput, error) {
+	reqBody := describeInstanceInformationRequest{
+		Filters: []instanceInformationFilter{
+			{
+				Key:    "InstanceIds",
+				Values: []string{input.InstanceID},
+			},
+		},
+		MaxResults: 5,
+	}
+
+	respBody, err := c.doRequest(ctx, "DescribeInstanceInformation", reqBody)
+	if err != nil {
+		return nil, err
+	}
+
+	var resp describeInstanceInformationResponse
+	if err := json.Unmarshal(respBody, &resp); err != nil {
+		return nil, fmt.Errorf("failed to parse DescribeInstanceInformation response: %w", err)
+	}
+
+	output := &DescribeInstanceInformationOutput{}
+	if len(resp.InstanceInformationList) > 0 {
+		output.PingStatus = resp.InstanceInformationList[0].PingStatus
+	}
+
+	return output, nil
+}
+
 func (c *HTTPClient) doRequest(ctx context.Context, action string, reqBody interface{}) ([]byte, error) {
 	endpoint := fmt.Sprintf("https://ssm.%s.amazonaws.com/", c.region)
 
@@ -154,6 +184,24 @@ type terminateSessionRequest struct {
 
 type terminateSessionResponse struct {
 	SessionId string `json:"SessionId"`
+}
+
+type describeInstanceInformationRequest struct {
+	Filters    []instanceInformationFilter `json:"Filters"`
+	MaxResults int                         `json:"MaxResults"`
+}
+
+type instanceInformationFilter struct {
+	Key    string   `json:"Key"`
+	Values []string `json:"Values"`
+}
+
+type describeInstanceInformationResponse struct {
+	InstanceInformationList []instanceInformation `json:"InstanceInformationList"`
+}
+
+type instanceInformation struct {
+	PingStatus string `json:"PingStatus"`
 }
 
 type ssmErrorResponse struct {

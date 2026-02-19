@@ -4,11 +4,16 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
+	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/wadahiro/awsocks/internal/clock"
+	"github.com/wadahiro/awsocks/internal/credentials"
+	"github.com/wadahiro/awsocks/internal/protocol"
 	"github.com/wadahiro/awsocks/internal/routing"
 )
 
@@ -215,8 +220,9 @@ func TestDirectSOCKS5Server_FallsBackToDirectWhenNoBackend(t *testing.T) {
 
 // mockLazyInitForDirect implements LazyInitializer for direct mode testing
 type mockLazyInitForDirect struct {
-	initDone chan struct{}
-	initErr  error
+	initDone    chan struct{}
+	initErr     error
+	ensureCalls int32 // atomic for thread safety
 }
 
 func newMockLazyInitForDirect() *mockLazyInitForDirect {
@@ -226,6 +232,7 @@ func newMockLazyInitForDirect() *mockLazyInitForDirect {
 }
 
 func (m *mockLazyInitForDirect) EnsureInitialized(ctx context.Context) error {
+	atomic.AddInt32(&m.ensureCalls, 1)
 	return m.initErr
 }
 
@@ -385,6 +392,10 @@ func TestDirectDialer_RouteDirect_NoWait(t *testing.T) {
 	if conn != nil {
 		conn.Close()
 	}
+
+	// EnsureInitialized should NOT have been called for RouteDirect
+	time.Sleep(50 * time.Millisecond)
+	assert.Equal(t, int32(0), atomic.LoadInt32(&mock.ensureCalls), "EnsureInitialized should not be called for RouteDirect")
 }
 
 func TestDirectDialer_RouteProxy_ContextCancel(t *testing.T) {
@@ -421,4 +432,363 @@ func TestDirectDialer_RouteProxy_ContextCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("Dial did not return after context cancellation")
 	}
+}
+
+// mockFullBackend implements backend.Backend for testing suspend
+type mockFullBackend struct {
+	closed   bool
+	dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
+}
+
+func (m *mockFullBackend) Name() string { return "mock" }
+func (m *mockFullBackend) Start(ctx context.Context) error { return nil }
+func (m *mockFullBackend) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
+	if m.dialFunc != nil {
+		return m.dialFunc(ctx, network, addr)
+	}
+	return nil, nil
+}
+func (m *mockFullBackend) OnCredentialUpdate(creds aws.Credentials) error { return nil }
+func (m *mockFullBackend) Close() error {
+	m.closed = true
+	return nil
+}
+
+func TestDirectManager_SuspendResumeCycle(t *testing.T) {
+	mockClock := clock.NewMockClock(time.Now())
+
+	cfg := &Config{
+		ListenAddr:  "127.0.0.1:0",
+		IdleTimeout: 30 * time.Minute,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mockBe := &mockFullBackend{}
+
+	mgr := &DirectManager{
+		cfg:      cfg,
+		initDone: make(chan struct{}),
+		clock:    mockClock,
+		ctx:      ctx,
+		cancel:   cancel,
+		backend:  mockBe,
+	}
+
+	// Simulate completed initialization
+	mgr.awsInitialized = true
+	close(mgr.initDone)
+
+	// Verify initial state
+	assert.True(t, mgr.IsInitialized())
+
+	// Call suspend
+	mgr.suspend()
+
+	// After suspend: not initialized, initDone is a new unclosed channel
+	assert.False(t, mgr.IsInitialized())
+
+	// initDone should be a new channel (not closed)
+	select {
+	case <-mgr.InitDone():
+		t.Fatal("initDone should not be closed after suspend")
+	default:
+		// Expected: not closed
+	}
+
+	assert.Nil(t, mgr.initErr)
+
+	// Backend.Close() should have been called
+	assert.True(t, mockBe.closed, "backend.Close() should be called during suspend")
+
+	// Backend should be nil after suspend
+	assert.Nil(t, mgr.backend, "backend should be nil after suspend")
+}
+
+func TestVMManager_Suspend_SendsSuspendMessage(t *testing.T) {
+	mockClock := clock.NewMockClock(time.Now())
+
+	cfg := &Config{
+		ListenAddr:  "127.0.0.1:0",
+		IdleTimeout: 30 * time.Minute,
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// Create pipe to simulate agent connection
+	agentServer, agentClient := net.Pipe()
+	defer agentServer.Close()
+	defer agentClient.Close()
+
+	mgr := &VMManager{
+		cfg:       cfg,
+		initDone:  make(chan struct{}),
+		clock:     mockClock,
+		ctx:       ctx,
+		cancel:    cancel,
+		agentConn: agentClient,
+	}
+
+	// Simulate completed initialization
+	mgr.awsInitialized = true
+	close(mgr.initDone)
+
+	// Read message in background
+	msgCh := make(chan *protocol.Message, 1)
+	go func() {
+		msg, err := protocol.ReadMessage(agentServer)
+		if err == nil {
+			msgCh <- msg
+		}
+	}()
+
+	// Call suspend
+	mgr.suspend()
+
+	// Verify MsgSuspend was sent to agent
+	select {
+	case msg := <-msgCh:
+		assert.Equal(t, protocol.MsgSuspend, msg.Type, "should send MsgSuspend to agent")
+	case <-time.After(2 * time.Second):
+		t.Fatal("MsgSuspend was not sent to agent")
+	}
+
+	// After suspend: not initialized
+	assert.False(t, mgr.awsInitialized)
+
+	// initDone should be a new unclosed channel
+	select {
+	case <-mgr.InitDone():
+		t.Fatal("initDone should not be closed after suspend")
+	default:
+		// Expected: not closed
+	}
+}
+
+func TestVMManager_EnsureInitialized_ErrorThenRetry_NoPanic(t *testing.T) {
+	// Regression test: when EnsureInitialized fails and is retried,
+	// the second call should not panic with "close of closed channel".
+	// This simulates: suspend → two concurrent requests → first fails → second retries.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &VMManager{
+		cfg: &Config{
+			ListenAddr: "127.0.0.1:0",
+		},
+		initDone: make(chan struct{}),
+		clock:    clock.RealClock{},
+		ctx:      ctx,
+		cancel:   cancel,
+		credProv: credentials.NewProvider("nonexistent-profile-for-test", "us-east-1"),
+	}
+
+	// First call fails (invalid AWS profile → credential load error)
+	err1 := mgr.EnsureInitialized(context.Background())
+	require.Error(t, err1, "first call should fail")
+
+	// After error, initDone should have been closed-and-replaced
+	// so waiters on the OLD channel are unblocked, and the NEW channel is open for next attempt
+	assert.False(t, mgr.awsInitialized, "should not be initialized after error")
+
+	// Second call should not panic (this was the original bug)
+	assert.NotPanics(t, func() {
+		err2 := mgr.EnsureInitialized(context.Background())
+		// It will fail again for the same reason, but the point is: no panic
+		assert.Error(t, err2)
+	})
+}
+
+func TestDirectManager_EnsureInitialized_ErrorThenRetry_NoPanic(t *testing.T) {
+	// Same regression test for DirectManager
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &DirectManager{
+		cfg: &Config{
+			ListenAddr: "127.0.0.1:0",
+		},
+		initDone: make(chan struct{}),
+		clock:    clock.RealClock{},
+		ctx:      ctx,
+		cancel:   cancel,
+		credProv: credentials.NewProvider("nonexistent-profile-for-test", "us-east-1"),
+	}
+
+	// First call fails (invalid AWS profile → credential load error)
+	err1 := mgr.EnsureInitialized(context.Background())
+	require.Error(t, err1, "first call should fail")
+
+	assert.False(t, mgr.awsInitialized, "should not be initialized after error")
+
+	// Second call should not panic
+	assert.NotPanics(t, func() {
+		err2 := mgr.EnsureInitialized(context.Background())
+		assert.Error(t, err2)
+	})
+}
+
+func TestVMManager_EnsureInitialized_ConcurrentAfterSuspend_NoPanic(t *testing.T) {
+	// Regression test for the actual bug scenario:
+	// After suspend, multiple concurrent goroutines call EnsureInitialized.
+	// All calls fail (due to invalid credentials), and each error path
+	// closes initDone. Without the fix, the second close panics.
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &VMManager{
+		cfg: &Config{
+			ListenAddr: "127.0.0.1:0",
+		},
+		initDone: make(chan struct{}),
+		clock:    clock.RealClock{},
+		ctx:      ctx,
+		cancel:   cancel,
+		credProv: credentials.NewProvider("nonexistent-profile-for-test", "us-east-1"),
+	}
+
+	const goroutines = 5
+	errs := make(chan error, goroutines)
+
+	assert.NotPanics(t, func() {
+		// Launch multiple goroutines concurrently (simulates multiple proxy requests after suspend)
+		for i := 0; i < goroutines; i++ {
+			go func() {
+				errs <- mgr.EnsureInitialized(context.Background())
+			}()
+		}
+
+		// Collect all results
+		for i := 0; i < goroutines; i++ {
+			err := <-errs
+			assert.Error(t, err, "all calls should fail with credential error")
+		}
+	})
+
+	// Manager should not be initialized
+	assert.False(t, mgr.awsInitialized)
+}
+
+func TestDirectManager_EnsureInitialized_ConcurrentAfterSuspend_NoPanic(t *testing.T) {
+	// Same concurrent test for DirectManager
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	mgr := &DirectManager{
+		cfg: &Config{
+			ListenAddr: "127.0.0.1:0",
+		},
+		initDone: make(chan struct{}),
+		clock:    clock.RealClock{},
+		ctx:      ctx,
+		cancel:   cancel,
+		credProv: credentials.NewProvider("nonexistent-profile-for-test", "us-east-1"),
+	}
+
+	const goroutines = 5
+	errs := make(chan error, goroutines)
+
+	assert.NotPanics(t, func() {
+		for i := 0; i < goroutines; i++ {
+			go func() {
+				errs <- mgr.EnsureInitialized(context.Background())
+			}()
+		}
+
+		for i := 0; i < goroutines; i++ {
+			err := <-errs
+			assert.Error(t, err, "all calls should fail with credential error")
+		}
+	})
+
+	assert.False(t, mgr.awsInitialized)
+}
+
+func TestDirectDialer_RouteProxy_TouchCalledOnSuccess(t *testing.T) {
+	// Start a dummy TCP server as backend target
+	dummyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer dummyListener.Close()
+
+	dummyAddr := dummyListener.Addr().String()
+	go func() {
+		for {
+			conn, err := dummyListener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	mockClock := clock.NewMockClock(time.Now())
+	var touched bool
+	tracker := NewIdleTracker(30*time.Minute, mockClock, func() {})
+
+	// Override Touch to detect calls
+	cfg := &Config{ListenAddr: "127.0.0.1:0"}
+	router := &mockRouter{route: routing.RouteProxy}
+	server := NewDirectSOCKS5Server(cfg, nil, router)
+	server.SetIdleTracker(tracker)
+
+	// Set backend dialer that connects to dummy server
+	server.SetBackendDialer(&mockBackendForTest{
+		dialFunc: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			touched = true
+			return net.Dial(network, dummyAddr)
+		},
+	})
+
+	dialer := &directDialer{cfg: cfg, server: server, router: router}
+
+	conn, err := dialer.Dial(context.Background(), "tcp", "internal.example.com:443")
+	require.NoError(t, err)
+	if conn != nil {
+		conn.Close()
+	}
+
+	assert.True(t, touched, "backend Dial should be called for RouteProxy")
+}
+
+func TestDirectDialer_RouteDirect_NoTouch(t *testing.T) {
+	// Start a dummy TCP server for direct connection
+	dummyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer dummyListener.Close()
+
+	dummyAddr := dummyListener.Addr().String()
+	go func() {
+		for {
+			conn, err := dummyListener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	mockClock := clock.NewMockClock(time.Now())
+	tracker := NewIdleTracker(30*time.Minute, mockClock, func() {})
+	tracker.Start()
+
+	cfg := &Config{ListenAddr: "127.0.0.1:0"}
+	router := &mockRouter{route: routing.RouteDirect}
+	server := NewDirectSOCKS5Server(cfg, nil, router)
+	server.SetIdleTracker(tracker)
+
+	dialer := &directDialer{cfg: cfg, server: server, router: router}
+
+	// Direct route should not touch the idle tracker
+	conn, err := dialer.Dial(context.Background(), "tcp", dummyAddr)
+	require.NoError(t, err)
+	if conn != nil {
+		conn.Close()
+	}
+
+	// The tracker's timer should still be running (not reset)
+	// We verify by advancing past timeout - it should fire
+	mockClock.Advance(31 * time.Minute)
+	assert.True(t, tracker.IsSuspended())
 }

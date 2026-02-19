@@ -1,5 +1,7 @@
 package config
 
+import "time"
+
 // CLIFlags represents configuration values provided via command-line flags.
 // Fields with IsSet suffix indicate whether the flag was explicitly set by the user.
 type CLIFlags struct {
@@ -47,6 +49,7 @@ type MergedConfig struct {
 	SSHKeyPassphrase string
 	AutoStart        bool
 	AutoStop         bool
+	IdleTimeout      time.Duration
 	Mode             string
 	Listen           string
 	RemotePort       int
@@ -100,6 +103,11 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		if defaults.Routing != nil {
 			result.Routing = mergeRoutingFromDefaults(defaults.Routing)
 		}
+		if defaults.IdleTimeout != "" {
+			if d, err := time.ParseDuration(defaults.IdleTimeout); err == nil {
+				result.IdleTimeout = d
+			}
+		}
 	}
 
 	// Apply profile settings
@@ -145,6 +153,14 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		}
 		if profile.Routing != nil {
 			result.Routing = mergeRoutingFromProfile(result.Routing, profile.Routing)
+		}
+		if profile.IdleTimeout != "" {
+			if d, err := time.ParseDuration(profile.IdleTimeout); err == nil {
+				result.IdleTimeout = d
+			} else {
+				// Invalid profile value resets to zero
+				result.IdleTimeout = 0
+			}
 		}
 	}
 

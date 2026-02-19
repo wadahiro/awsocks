@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"github.com/wadahiro/awsocks/internal/clock"
 	"github.com/wadahiro/awsocks/internal/protocol"
 	"github.com/wadahiro/awsocks/internal/routing"
 )
@@ -78,7 +80,7 @@ func TestSOCKS5Server_StopBeforeStart(t *testing.T) {
 type mockLazyInit struct {
 	initDone    chan struct{}
 	initErr     error
-	ensureCalls int
+	ensureCalls int32 // atomic for thread safety
 }
 
 func newMockLazyInit() *mockLazyInit {
@@ -88,7 +90,7 @@ func newMockLazyInit() *mockLazyInit {
 }
 
 func (m *mockLazyInit) EnsureInitialized(ctx context.Context) error {
-	m.ensureCalls++
+	atomic.AddInt32(&m.ensureCalls, 1)
 	return m.initErr
 }
 
@@ -228,7 +230,7 @@ func TestSOCKS5Server_dialViaAgent_RouteProxy_InitFailure(t *testing.T) {
 	}
 }
 
-func TestSOCKS5Server_dialViaAgent_RouteVMDirect_NoWait(t *testing.T) {
+func TestSOCKS5Server_dialViaAgent_RouteVMDirect_NoInitTrigger(t *testing.T) {
 	agentServer, agentClient := net.Pipe()
 	defer agentServer.Close()
 	defer agentClient.Close()
@@ -243,7 +245,7 @@ func TestSOCKS5Server_dialViaAgent_RouteVMDirect_NoWait(t *testing.T) {
 	go mockAgent(t, agentServer)
 	go server.readFromAgent()
 
-	// RouteVMDirect should return immediately, not wait for init
+	// RouteVMDirect should return immediately without triggering initialization
 	resultCh := make(chan connResult, 1)
 	go func() {
 		conn, err := server.dialViaAgent(context.Background(), "tcp", "example.com:443")
@@ -260,6 +262,10 @@ func TestSOCKS5Server_dialViaAgent_RouteVMDirect_NoWait(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("dialViaAgent should return immediately for RouteVMDirect")
 	}
+
+	// EnsureInitialized should NOT have been called
+	time.Sleep(50 * time.Millisecond) // wait for any async goroutine to execute
+	assert.Equal(t, int32(0), atomic.LoadInt32(&mock.ensureCalls), "EnsureInitialized should not be called for RouteVMDirect")
 }
 
 func TestSOCKS5Server_dialViaAgent_RouteProxy_ContextCancel(t *testing.T) {
@@ -293,4 +299,67 @@ func TestSOCKS5Server_dialViaAgent_RouteProxy_ContextCancel(t *testing.T) {
 	case <-time.After(2 * time.Second):
 		t.Fatal("dialViaAgent did not return after context cancellation")
 	}
+}
+
+func TestSOCKS5Server_dialViaAgent_RouteProxy_TouchCalledOnSuccess(t *testing.T) {
+	agentServer, agentClient := net.Pipe()
+	defer agentServer.Close()
+	defer agentClient.Close()
+
+	mockClock := clock.NewMockClock(time.Now())
+	tracker := NewIdleTracker(30*time.Minute, mockClock, func() {})
+	tracker.Start()
+
+	router := &mockRouter{route: routing.RouteProxy}
+	server := NewSOCKS5Server("127.0.0.1:0", agentClient, router)
+	server.SetIdleTracker(tracker)
+
+	// Start mock agent and readFromAgent
+	go mockAgent(t, agentServer)
+	go server.readFromAgent()
+
+	// Init is already complete (no lazy initializer set)
+	conn, err := server.dialViaAgent(context.Background(), "tcp", "internal.example.com:443")
+	require.NoError(t, err)
+	assert.NotNil(t, conn)
+	if conn != nil {
+		conn.Close()
+	}
+
+	// After a successful RouteProxy dial, the timer should have been reset via Touch()
+	// Advance 29 minutes - should not fire yet (Touch restarted timer)
+	mockClock.Advance(29 * time.Minute)
+	assert.False(t, tracker.IsSuspended())
+
+	// Advance past timeout since last Touch
+	mockClock.Advance(2 * time.Minute)
+	assert.True(t, tracker.IsSuspended())
+}
+
+func TestSOCKS5Server_dialViaAgent_RouteVMDirect_NoTouch(t *testing.T) {
+	agentServer, agentClient := net.Pipe()
+	defer agentServer.Close()
+	defer agentClient.Close()
+
+	mockClock := clock.NewMockClock(time.Now())
+	tracker := NewIdleTracker(30*time.Minute, mockClock, func() {})
+	tracker.Start()
+
+	router := &mockRouter{route: routing.RouteVMDirect}
+	server := NewSOCKS5Server("127.0.0.1:0", agentClient, router)
+	server.SetIdleTracker(tracker)
+
+	go mockAgent(t, agentServer)
+	go server.readFromAgent()
+
+	conn, err := server.dialViaAgent(context.Background(), "tcp", "example.com:443")
+	require.NoError(t, err)
+	if conn != nil {
+		conn.Close()
+	}
+
+	// RouteVMDirect should NOT touch the tracker
+	// Timer started at 0, advancing 31 minutes should fire
+	mockClock.Advance(31 * time.Minute)
+	assert.True(t, tracker.IsSuspended())
 }

@@ -78,6 +78,7 @@ type SOCKS5Server struct {
 	listener        net.Listener
 	listenerMu      sync.Mutex
 	lazyInitializer LazyInitializer
+	idleTracker     *IdleTracker
 }
 
 // NewSOCKS5Server creates a new SOCKS5 server
@@ -140,6 +141,11 @@ func (s *SOCKS5Server) SetVMManager(initializer LazyInitializer) {
 	s.lazyInitializer = initializer
 }
 
+// SetIdleTracker sets the idle tracker for activity monitoring
+func (s *SOCKS5Server) SetIdleTracker(tracker *IdleTracker) {
+	s.idleTracker = tracker
+}
+
 // dialViaAgent establishes a connection through the VM agent
 func (s *SOCKS5Server) dialViaAgent(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, _, err := net.SplitHostPort(addr)
@@ -159,35 +165,31 @@ func (s *SOCKS5Server) dialViaAgent(ctx context.Context, network, addr string) (
 		return dialer.DialContext(ctx, network, addr)
 	}
 
-	// Check if lazy initialization is needed
-	if s.lazyInitializer != nil && !s.isInitialized() {
+	// Check if lazy initialization is needed (only for RouteProxy)
+	if route == routing.RouteProxy && s.lazyInitializer != nil && !s.isInitialized() {
 		// Start initialization in background (non-blocking)
 		go s.lazyInitializer.EnsureInitialized(context.Background())
 
-		if route == routing.RouteProxy {
-			// Hold proxy connections until initialization completes
-			proxyLogger.Info("Waiting for initialization to complete", "address", addr)
-			select {
-			case <-ctx.Done():
-				return nil, ctx.Err()
-			case <-s.lazyInitializer.InitDone():
-				if err := s.lazyInitializer.InitError(); err != nil {
-					return nil, fmt.Errorf("initialization failed: %w", err)
-				}
-				proxyLogger.Info("Initialization complete, dialing via proxy", "address", addr)
-				// Fall through to normal proxy dial below
+		// Hold proxy connections until initialization completes
+		proxyLogger.Info("Waiting for initialization to complete", "address", addr)
+		select {
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		case <-s.lazyInitializer.InitDone():
+			if err := s.lazyInitializer.InitError(); err != nil {
+				return nil, fmt.Errorf("initialization failed: %w", err)
 			}
-		} else {
-			// RouteVMDirect: use vm-direct immediately to avoid blocking
-			// This allows OIDC auth flow and other requests to proceed
-			proxyLogger.Debug("Initialization in progress, using vm-direct", "address", addr)
-			return s.dialWithRoute(ctx, network, addr, routing.RouteVMDirect)
+			proxyLogger.Info("Initialization complete, dialing via proxy", "address", addr)
+			// Fall through to normal proxy dial below
 		}
 	}
 
 	// Try primary route
 	conn, err := s.dialWithRoute(ctx, network, addr, route)
 	if err == nil {
+		if route == routing.RouteProxy && s.idleTracker != nil {
+			s.idleTracker.Touch()
+		}
 		return conn, nil
 	}
 
@@ -205,7 +207,11 @@ func (s *SOCKS5Server) dialViaAgent(ctx context.Context, network, addr string) (
 	proxyLogger.Info("Fallback to alternative route",
 		"address", addr, "from", route, "to", fallbackRoute, "reason", err)
 
-	return s.dialWithRoute(ctx, network, addr, fallbackRoute)
+	fallbackConn, fallbackErr := s.dialWithRoute(ctx, network, addr, fallbackRoute)
+	if fallbackErr == nil && fallbackRoute == routing.RouteProxy && s.idleTracker != nil {
+		s.idleTracker.Touch()
+	}
+	return fallbackConn, fallbackErr
 }
 
 // isInitialized checks if lazy initialization is complete

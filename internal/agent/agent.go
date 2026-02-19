@@ -103,6 +103,8 @@ func (a *Agent) handleMessage(msg *protocol.Message) error {
 		return a.handleCredentialUpdate(msg)
 	case protocol.MsgPing:
 		return a.handlePing(msg)
+	case protocol.MsgSuspend:
+		return a.handleSuspend()
 	case protocol.MsgShutdown:
 		logger.Info("Received shutdown request")
 		a.cancel()
@@ -229,6 +231,28 @@ func (a *Agent) handleClose(msg *protocol.Message) error {
 		c.Close()
 	}
 
+	return nil
+}
+
+func (a *Agent) handleSuspend() error {
+	a.logInfo("Received suspend request, closing backend without reconnect")
+
+	// Close backend (this cancels its context, preventing reconnect)
+	if a.backend != nil {
+		a.backend.Close()
+		a.backend = nil
+	}
+
+	// Close all active connections
+	a.connMu.Lock()
+	for id, c := range a.connections {
+		c.Close()
+		delete(a.connections, id)
+	}
+	a.connMu.Unlock()
+
+	// Keep backendConfig so next credential update can re-initialize
+	a.logInfo("Backend suspended, waiting for re-initialization")
 	return nil
 }
 

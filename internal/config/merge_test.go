@@ -2,6 +2,7 @@ package config
 
 import (
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 )
@@ -263,6 +264,58 @@ func TestMerge_AutoStartStop(t *testing.T) {
 	// Profile AutoStart preserved, CLI AutoStop overrides
 	assert.True(t, result.AutoStart)
 	assert.True(t, result.AutoStop)
+}
+
+func TestMerge_IdleTimeout(t *testing.T) {
+	tests := []struct {
+		name             string
+		defaultsTimeout  string
+		profileTimeout   string
+		expectedTimeout  time.Duration
+	}{
+		{
+			name:            "defaults only",
+			defaultsTimeout: "30m",
+			expectedTimeout: 30 * time.Minute,
+		},
+		{
+			name:            "profile overrides defaults",
+			defaultsTimeout: "30m",
+			profileTimeout:  "1h",
+			expectedTimeout: time.Hour,
+		},
+		{
+			name:            "profile only",
+			profileTimeout:  "45m",
+			expectedTimeout: 45 * time.Minute,
+		},
+		{
+			name:            "no timeout set",
+			expectedTimeout: 0,
+		},
+		{
+			name:            "invalid defaults ignored",
+			defaultsTimeout: "invalid",
+			expectedTimeout: 0,
+		},
+		{
+			name:            "invalid profile ignored",
+			defaultsTimeout: "30m",
+			profileTimeout:  "invalid",
+			expectedTimeout: 0,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			defaults := &Defaults{IdleTimeout: tt.defaultsTimeout}
+			profile := &Profile{IdleTimeout: tt.profileTimeout}
+			cli := &CLIFlags{}
+
+			result := Merge(defaults, profile, cli)
+			assert.Equal(t, tt.expectedTimeout, result.IdleTimeout)
+		})
+	}
 }
 
 func TestMerge_SSHKeyPassphrase(t *testing.T) {

@@ -33,8 +33,9 @@ type Profile struct {
 	SSHKeyPassphrase string `toml:"ssh-key-passphrase"`
 
 	// Instance lifecycle
-	AutoStart bool `toml:"auto-start"`
-	AutoStop  bool `toml:"auto-stop"`
+	AutoStart   bool   `toml:"auto-start"`
+	AutoStop    bool   `toml:"auto-stop"`
+	IdleTimeout string `toml:"idle-timeout"` // e.g., "30m", "1h"
 
 	// Proxy settings
 	Mode       string `toml:"mode"`
@@ -48,11 +49,12 @@ type Profile struct {
 
 // Defaults holds default values that apply when not specified in a profile.
 type Defaults struct {
-	SSHUser    string `toml:"ssh-user"`
-	Listen     string `toml:"listen"`
-	Mode       string `toml:"mode"`
-	RemotePort int    `toml:"remote-port"`
-	Lazy       *bool  `toml:"lazy"`
+	SSHUser     string `toml:"ssh-user"`
+	Listen      string `toml:"listen"`
+	Mode        string `toml:"mode"`
+	RemotePort  int    `toml:"remote-port"`
+	Lazy        *bool  `toml:"lazy"`
+	IdleTimeout string `toml:"idle-timeout"` // e.g., "30m", "1h"
 
 	// Default routing configuration
 	Routing *RoutingConfig `toml:"routing"`

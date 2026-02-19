@@ -349,10 +349,67 @@ func (b *Backend) connectWithEC2Start() {
 		b.state = StateConnecting
 		b.stateMu.Unlock()
 		b.notifyStateChange()
+
+		// Wait for SSM agent to become online after EC2 start
+		if err := b.waitForSSMAgent(); err != nil {
+			b.logError("SSM agent not ready: %v", err)
+			b.setErrorState()
+			return
+		}
 	}
 
 	// Now proceed with normal connection
 	b.connect()
+}
+
+// Default polling interval for waitForSSMAgent
+var ssmAgentPollInterval = 5 * time.Second
+
+// waitForSSMAgent polls DescribeInstanceInformation until PingStatus is "Online"
+func (b *Backend) waitForSSMAgent() error {
+	return b.waitForSSMAgentWithTimeout(2 * time.Minute)
+}
+
+// waitForSSMAgentWithTimeout polls DescribeInstanceInformation with a configurable timeout
+func (b *Backend) waitForSSMAgentWithTimeout(timeout time.Duration) error {
+	ticker := time.NewTicker(ssmAgentPollInterval)
+	defer ticker.Stop()
+
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	// Check immediately before first tick
+	output, err := b.ssmClient.DescribeInstanceInformation(b.ctx, &DescribeInstanceInformationInput{
+		InstanceID: b.config.InstanceID,
+	})
+	if err == nil && output.PingStatus == "Online" {
+		b.logInfo("SSM agent is online instance=%s", b.config.InstanceID)
+		return nil
+	}
+
+	b.logInfo("Waiting for SSM agent to become online... instance=%s", b.config.InstanceID)
+
+	for {
+		select {
+		case <-b.ctx.Done():
+			return b.ctx.Err()
+		case <-timer.C:
+			return fmt.Errorf("timeout waiting for SSM agent to become online after %v", timeout)
+		case <-ticker.C:
+			output, err := b.ssmClient.DescribeInstanceInformation(b.ctx, &DescribeInstanceInformationInput{
+				InstanceID: b.config.InstanceID,
+			})
+			if err != nil {
+				b.logWarn("DescribeInstanceInformation failed: %v", err)
+				continue
+			}
+			if output.PingStatus == "Online" {
+				b.logInfo("SSM agent is now online instance=%s", b.config.InstanceID)
+				return nil
+			}
+			b.logDebug("SSM agent not ready yet pingStatus=%s instance=%s", output.PingStatus, b.config.InstanceID)
+		}
+	}
 }
 
 // connect establishes the full connection stack

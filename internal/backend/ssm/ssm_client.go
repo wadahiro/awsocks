@@ -8,4 +8,5 @@ import (
 type SSMClient interface {
 	StartSession(ctx context.Context, input *StartSessionInput) (*StartSessionOutput, error)
 	TerminateSession(ctx context.Context, input *TerminateSessionInput) (*TerminateSessionOutput, error)
+	DescribeInstanceInformation(ctx context.Context, input *DescribeInstanceInformationInput) (*DescribeInstanceInformationOutput, error)
 }
