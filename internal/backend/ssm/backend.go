@@ -368,6 +368,13 @@ func (b *Backend) connectWithEC2Start() {
 // Default polling interval for waitForSSMAgent
 var ssmAgentPollInterval = 5 * time.Second
 
+// SSH handshake parameters (package-level vars for testing)
+var (
+	sshMaxRetries       = 10
+	sshRetryInterval    = 500 * time.Millisecond
+	sshHandshakeTimeout = 30 * time.Second
+)
+
 // waitForSSMAgent polls DescribeInstanceInformation until PingStatus is "Online"
 func (b *Backend) waitForSSMAgent() error {
 	return b.waitForSSMAgentWithTimeout(2 * time.Minute)
@@ -504,14 +511,18 @@ func (b *Backend) tryConnect() error {
 		b.logError("DataChannel error: %v", err)
 	})
 
-	// NOTE: Disconnect handler is set AFTER SSH handshake succeeds
-	// to avoid false reconnects during SSH retry
-
 	// Set up net.Pipe bridge for SSH <-> DataChannel (with output callback)
 	if err := b.setupDataBridge(true); err != nil {
 		b.dataChannel.Close()
 		return fmt.Errorf("failed to setup data bridge: %w", err)
 	}
+
+	// Set temporary disconnect handler to interrupt SSH handshake.
+	// If WebSocket disconnects during SSH handshake, close the pipe to unblock ssh.NewClientConn.
+	b.dataChannel.SetOnDisconnect(func() {
+		b.logWarn("DataChannel disconnected during SSH handshake")
+		b.cleanupDataBridge()
+	})
 
 	// Establish SSH over the bridge (sshConn side of net.Pipe)
 	b.logInfo("Starting SSH handshake...")
@@ -522,7 +533,7 @@ func (b *Backend) tryConnect() error {
 	}
 	b.logInfo("SSH connection established")
 
-	// Now that SSH is connected, set up disconnect handler for auto-reconnect
+	// SSH handshake succeeded: replace disconnect handler with reconnect handler
 	b.dataChannel.SetOnDisconnect(func() {
 		b.logWarn("DataChannel disconnected, triggering reconnect...")
 		b.triggerReconnect()
@@ -655,35 +666,59 @@ func (b *Backend) cleanupDataBridge() {
 }
 
 // connectSSH establishes SSH over the net.Pipe bridge
-// It retries SSH handshake with short intervals since SSM agent may not be ready immediately
+// It retries SSH handshake with short intervals since SSM agent may not be ready immediately.
+// Each attempt has a timeout to prevent hanging when the WebSocket disconnects
+// (net.Pipe does not support SetDeadline, so ssh.ClientConfig.Timeout is ineffective).
 func (b *Backend) connectSSH() error {
 	if b.sshConfig == nil {
 		return fmt.Errorf("SSH config not initialized")
 	}
 
-	const maxSSHRetries = 10
-	const sshRetryInterval = 500 * time.Millisecond
+	type sshResult struct {
+		conn  ssh.Conn
+		chans <-chan ssh.NewChannel
+		reqs  <-chan *ssh.Request
+		err   error
+	}
 
 	var lastErr error
-	for attempt := 1; attempt <= maxSSHRetries; attempt++ {
-		// Create SSH connection over sshConn side of net.Pipe
-		// All writes go through transferDataToSSM for serialization
-		sshClientConn, chans, reqs, err := ssh.NewClientConn(b.sshConn, "ssm:22", b.sshConfig)
-		if err == nil {
-			client := ssh.NewClient(sshClientConn, chans, reqs)
-			b.sshMu.Lock()
-			b.sshClient = client
-			b.sshMu.Unlock()
-			if attempt > 1 {
-				b.logDebug("SSH handshake succeeded on attempt %d", attempt)
+	for attempt := 1; attempt <= sshMaxRetries; attempt++ {
+		// Run SSH handshake in a goroutine with timeout
+		resultCh := make(chan sshResult, 1)
+		go func() {
+			c, ch, r, err := ssh.NewClientConn(b.sshConn, "ssm:22", b.sshConfig)
+			resultCh <- sshResult{c, ch, r, err}
+		}()
+
+		timer := time.NewTimer(sshHandshakeTimeout)
+		select {
+		case result := <-resultCh:
+			timer.Stop()
+			if result.err == nil {
+				client := ssh.NewClient(result.conn, result.chans, result.reqs)
+				b.sshMu.Lock()
+				b.sshClient = client
+				b.sshMu.Unlock()
+				if attempt > 1 {
+					b.logDebug("SSH handshake succeeded on attempt %d", attempt)
+				}
+				return nil
 			}
-			return nil
+			lastErr = result.err
+		case <-timer.C:
+			// Timeout: close pipe to unblock the goroutine
+			b.cleanupDataBridge()
+			<-resultCh // wait for goroutine to finish (pipe closed, so it returns quickly)
+			lastErr = fmt.Errorf("SSH handshake timeout after %v", sshHandshakeTimeout)
+		case <-b.ctx.Done():
+			// Context cancelled: close pipe to unblock the goroutine
+			b.cleanupDataBridge()
+			<-resultCh
+			return b.ctx.Err()
 		}
 
-		lastErr = err
-		// Check if this is a retryable error (overflow = SSM agent not ready yet)
-		if attempt < maxSSHRetries {
-			b.logDebug("SSH handshake attempt %d failed: %v, retrying...", attempt, err)
+		if attempt < sshMaxRetries {
+			b.logDebug("SSH handshake attempt %d failed: %v, retrying...", attempt, lastErr)
 			time.Sleep(sshRetryInterval)
 
 			// Recreate the pipe for retry since SSH handshake corrupts the connection
@@ -695,7 +730,7 @@ func (b *Backend) connectSSH() error {
 		}
 	}
 
-	return fmt.Errorf("SSH handshake failed after %d attempts: %w", maxSSHRetries, lastErr)
+	return fmt.Errorf("SSH handshake failed after %d attempts: %w", sshMaxRetries, lastErr)
 }
 
 // monitorConnection monitors the SSH connection and triggers reconnect on failure

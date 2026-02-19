@@ -2,6 +2,9 @@ package ssm
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
+	"net"
 	"os"
 	"testing"
 	"time"
@@ -10,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"golang.org/x/crypto/ssh"
 )
 
 // MockSSMClient is a mock for SSM client
@@ -332,4 +336,138 @@ func TestWaitForSSMAgent_ContextCancelled(t *testing.T) {
 
 	err := b.waitForSSMAgentWithTimeout(2 * time.Minute)
 	assert.Error(t, err)
+}
+
+// newTestSSHConfig creates an SSH client config with an ed25519 key for testing
+func newTestSSHConfig(t *testing.T) *ssh.ClientConfig {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	require.NoError(t, err)
+
+	signer, err := ssh.NewSignerFromKey(priv)
+	require.NoError(t, err)
+
+	return &ssh.ClientConfig{
+		User:            "ec2-user",
+		Auth:            []ssh.AuthMethod{ssh.PublicKeys(signer)},
+		HostKeyCallback: ssh.InsecureIgnoreHostKey(),
+		Timeout:         30 * time.Second,
+	}
+}
+
+// useShortSSHTimeouts sets short SSH handshake parameters for testing and restores them on cleanup.
+func useShortSSHTimeouts(t *testing.T) {
+	t.Helper()
+	origMaxRetries := sshMaxRetries
+	origRetryInterval := sshRetryInterval
+	origHandshakeTimeout := sshHandshakeTimeout
+
+	sshMaxRetries = 1
+	sshRetryInterval = 50 * time.Millisecond
+	sshHandshakeTimeout = 2 * time.Second
+
+	t.Cleanup(func() {
+		sshMaxRetries = origMaxRetries
+		sshRetryInterval = origRetryInterval
+		sshHandshakeTimeout = origHandshakeTimeout
+	})
+}
+
+// newTestBackendWithPipe creates a Backend with net.Pipe set up for connectSSH testing.
+// Returns the backend and the remote side of the pipe (dcConn equivalent).
+func newTestBackendWithPipe(t *testing.T) (*Backend, net.Conn) {
+	t.Helper()
+	cfg := &Config{
+		InstanceID: "i-test",
+		Region:     "ap-northeast-1",
+		SSHUser:    "ec2-user",
+	}
+	b := New(cfg, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(func() {
+		cancel()
+		b.Close()
+	})
+	b.ctx = ctx
+	b.cancel = cancel
+	b.sshConfig = newTestSSHConfig(t)
+
+	// Create net.Pipe manually (simulating setupDataBridge)
+	sshSide, dcSide := net.Pipe()
+	b.sshConn = sshSide
+	b.dcConn = dcSide
+
+	// Start the transfer goroutine (reads from dcSide, would send to DataChannel)
+	go b.transferDataToSSM()
+
+	return b, dcSide
+}
+
+func TestConnectSSH_TimeoutWhenNoData(t *testing.T) {
+	// Test that connectSSH returns an error within a reasonable time
+	// when no data comes from the remote side (simulating WebSocket disconnect
+	// where StartReceiving has exited but nobody closed the pipe).
+	useShortSSHTimeouts(t)
+	b, dcSide := newTestBackendWithPipe(t)
+	defer dcSide.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- b.connectSSH()
+	}()
+
+	select {
+	case err := <-errCh:
+		// connectSSH should return an error (timeout)
+		assert.Error(t, err)
+		assert.Contains(t, err.Error(), "timeout")
+	case <-time.After(10 * time.Second):
+		t.Fatal("connectSSH hung - timeout mechanism not working")
+	}
+}
+
+func TestConnectSSH_PipeClosedReturnsError(t *testing.T) {
+	// Test that connectSSH returns promptly when the pipe is closed externally
+	// (simulating onDisconnect handler closing the pipe via cleanupDataBridge).
+	useShortSSHTimeouts(t)
+	b, _ := newTestBackendWithPipe(t)
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- b.connectSSH()
+	}()
+
+	// Close the pipe after a short delay to simulate onDisconnect handler
+	time.Sleep(100 * time.Millisecond)
+	b.cleanupDataBridge()
+
+	select {
+	case err := <-errCh:
+		assert.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("connectSSH did not return after pipe was closed")
+	}
+}
+
+func TestConnectSSH_ContextCancelledReturnsError(t *testing.T) {
+	// Test that connectSSH respects context cancellation
+	useShortSSHTimeouts(t)
+	b, dcSide := newTestBackendWithPipe(t)
+	defer dcSide.Close()
+
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- b.connectSSH()
+	}()
+
+	// Cancel context after a short delay
+	time.Sleep(100 * time.Millisecond)
+	b.cancel()
+
+	select {
+	case err := <-errCh:
+		assert.Error(t, err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("connectSSH did not return after context was cancelled")
+	}
 }
