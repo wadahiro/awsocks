@@ -16,7 +16,7 @@ import (
 	"github.com/wadahiro/awsocks/internal/log"
 )
 
-var logger = log.For(log.ComponentManager)
+var logger = log.For(log.ComponentEC2)
 
 // DialContextFunc is a function that dials a network connection.
 type DialContextFunc func(ctx context.Context, network, addr string) (net.Conn, error)
@@ -132,7 +132,11 @@ func (c *Client) WaitForSSMAgent(ctx context.Context, instanceID string, timeout
 				logger.Info("SSM agent is now online", "instance", instanceID)
 				return nil
 			}
-			logger.Info("Waiting for SSM agent", "instance", instanceID, "pingStatus", output.PingStatus)
+			pingStatus := output.PingStatus
+			if pingStatus == "" {
+				pingStatus = "not-registered"
+			}
+			logger.Info("Waiting for SSM agent", "instance", instanceID, "pingStatus", pingStatus)
 		}
 	}
 }
