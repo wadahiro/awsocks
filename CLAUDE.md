@@ -35,7 +35,7 @@ internal/
 ## Key Patterns
 
 - **Backend interface**: `internal/backend/backend.go` - all backends implement `Dial()`, `OnCredentialUpdate()`
-- **SSM state machine**: StateIdle → StateInitializing → StateActive → StateTransitioning
+- **SSM state machine**: StateIdle → StateStartingEC2 → StateConnecting → StateHandshaking → StateActive → StateReconnecting
 - **AgentMux**: `internal/mux/agent_mux.go` - single multiplexer over vsock, prevents dual-reader bugs
 - **Testing**: Use interfaces + mocks (testify/mock), table-driven tests
 - **Build tags**: `//go:build darwin` for VM code, `//go:build linux` for agent
