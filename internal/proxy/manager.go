@@ -476,11 +476,14 @@ func (m *Manager) credentialRefreshLoop(ctx context.Context) {
 		case <-ctx.Done():
 			return
 		case creds := <-m.credProv.RefreshChannel():
-			if m.backend == nil {
+			m.awsInitMu.Lock()
+			be := m.backend
+			m.awsInitMu.Unlock()
+			if be == nil {
 				continue
 			}
 			logger.Debug("Sending updated credentials to backend...")
-			if err := m.backend.OnCredentialUpdate(creds); err != nil {
+			if err := be.OnCredentialUpdate(creds); err != nil {
 				logger.Error("Failed to update backend credentials", "error", err)
 			} else {
 				logger.Debug("Backend credentials updated successfully")

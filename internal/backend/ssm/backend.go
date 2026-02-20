@@ -81,23 +81,20 @@ type Backend struct {
 	// DataChannel components
 	dataChannel *datachannel.DataChannel
 
-	// net.Pipe for data bridge (SSH <-> DataChannel)
-	sshConn net.Conn // SSH Client側
-	dcConn  net.Conn // DataChannel側
+	// Data bridge (net.Pipe + transfer goroutine lifecycle)
+	bridge *dataBridge
 
-	// SSH client
-	sshClient *ssh.Client
+	// SSH client (lock-free read via atomic.Pointer)
+	sshClient atomic.Pointer[ssh.Client]
 	sshConfig *ssh.ClientConfig
-	sshMu     sync.RWMutex
 
-	// State management
-	state       State
-	stateMu     sync.RWMutex
-	stateChange chan struct{}
+	// State management (lock-free read via atomic.Int32)
+	state       atomic.Int32   // stores State values
+	stateMu     sync.Mutex     // protects stateNotify close-and-recreate only
+	stateNotify chan struct{}   // closed on state change to broadcast to all waiters
 
-	// Credentials
-	credentials aws.Credentials
-	credsMu     sync.RWMutex
+	// Credentials (lock-free read via atomic.Value)
+	credentials atomic.Value // stores aws.Credentials
 
 	// Connection tracking
 	openChannels int64
@@ -108,12 +105,13 @@ type Backend struct {
 
 // New creates a new MuxSSH backend
 func New(cfg *Config, ssmClient SSMClient) *Backend {
-	return &Backend{
+	b := &Backend{
 		config:      cfg,
 		ssmClient:   ssmClient,
-		state:       StateIdle,
-		stateChange: make(chan struct{}, 1),
+		stateNotify: make(chan struct{}),
 	}
+	b.state.Store(int32(StateIdle))
+	return b
 }
 
 // log helper methods that use callback if available, otherwise use standard logger
@@ -149,6 +147,21 @@ func (b *Backend) logWarn(format string, args ...interface{}) {
 	}
 }
 
+// getState returns the current state (lock-free).
+func (b *Backend) getState() State {
+	return State(b.state.Load())
+}
+
+// setState atomically stores the new state and broadcasts to all waiters.
+func (b *Backend) setState(newState State) {
+	b.state.Store(int32(newState))
+	b.stateMu.Lock()
+	old := b.stateNotify
+	b.stateNotify = make(chan struct{})
+	b.stateMu.Unlock()
+	close(old)
+}
+
 // Name returns the backend name
 func (b *Backend) Name() string {
 	return "ssm"
@@ -174,46 +187,35 @@ func (b *Backend) Start(ctx context.Context) error {
 func (b *Backend) Dial(ctx context.Context, network, address string) (net.Conn, error) {
 	b.logDebug("Dial network=%s address=%s", network, address)
 
-	// Check state and potentially trigger lazy connection
-	b.stateMu.Lock()
-	state := b.state
-	if state == StateIdle {
-		// Lazy connection: trigger connection on first Dial
-		b.logInfo("Lazy connection: starting connection on first proxy request")
-		b.state = StateConnecting
-		b.stateMu.Unlock()
-		b.notifyStateChange()
+	// Check state and potentially trigger lazy connection (lock-free read)
+	state := b.getState()
+	switch {
+	case state == StateIdle:
+		// CAS to atomically transition Idle → Connecting (only one goroutine wins)
+		if b.state.CompareAndSwap(int32(StateIdle), int32(StateConnecting)) {
+			b.logInfo("Lazy connection: starting connection on first proxy request")
+			b.setState(StateConnecting)
 
-		// Start connection (including EC2 auto-start if configured)
-		go b.connectWithEC2Start()
+			// Start connection (including EC2 auto-start if configured)
+			go b.connectWithEC2Start()
+		}
 
 		// Wait for active state
 		if err := b.waitForActive(ctx); err != nil {
 			return nil, fmt.Errorf("lazy connection failed: %w", err)
 		}
-	} else if state == StateReconnecting || state == StateConnecting || state == StateStartingEC2 {
-		b.stateMu.Unlock()
+	case state == StateReconnecting || state == StateConnecting || state == StateStartingEC2 || state == StateHandshaking:
 		// Wait for connection to complete
 		if err := b.waitForActive(ctx); err != nil {
 			return nil, fmt.Errorf("backend not ready: %w", err)
 		}
-	} else if state == StateHandshaking {
-		b.stateMu.Unlock()
-		if err := b.waitForActive(ctx); err != nil {
-			return nil, fmt.Errorf("backend not ready: %w", err)
-		}
-	} else if state == StateError {
-		b.stateMu.Unlock()
+	case state == StateError:
 		return nil, fmt.Errorf("backend in error state")
-	} else {
-		// StateActive
-		b.stateMu.Unlock()
+	default:
+		// StateActive - proceed
 	}
 
-	b.sshMu.RLock()
-	client := b.sshClient
-	b.sshMu.RUnlock()
-
+	client := b.sshClient.Load()
 	if client == nil {
 		return nil, fmt.Errorf("SSH client not connected")
 	}
@@ -253,69 +255,55 @@ func (b *Backend) waitForActive(ctx context.Context) error {
 	return b.waitForActiveWithTimeout(ctx, 6*time.Minute) // Allow time for EC2 start + SSM connection
 }
 
-// waitForActiveWithTimeout waits for the backend to become active with a specified timeout
+// waitForActiveWithTimeout waits for the backend to become active with a specified timeout.
+// Uses broadcast notification via stateNotify channel (no polling needed).
 func (b *Backend) waitForActiveWithTimeout(ctx context.Context, d time.Duration) error {
 	timeout := time.After(d)
 	for {
+		state := b.getState()
+		if state == StateActive {
+			return nil
+		}
+		if state == StateError {
+			return fmt.Errorf("backend entered error state")
+		}
+
+		// Get current notification channel
+		b.stateMu.Lock()
+		waitCh := b.stateNotify
+		b.stateMu.Unlock()
+
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
 		case <-timeout:
 			return fmt.Errorf("timeout waiting for backend to become active")
-		case <-b.stateChange:
-			b.stateMu.RLock()
-			state := b.state
-			b.stateMu.RUnlock()
-
-			if state == StateActive {
-				return nil
-			}
-			if state == StateError {
-				return fmt.Errorf("backend entered error state")
-			}
-		case <-time.After(100 * time.Millisecond):
-			b.stateMu.RLock()
-			state := b.state
-			b.stateMu.RUnlock()
-
-			if state == StateActive {
-				return nil
-			}
-			if state == StateError {
-				return fmt.Errorf("backend entered error state")
-			}
+		case <-waitCh:
+			// State changed, re-check in next iteration
 		}
 	}
 }
 
-// SetCredentials stores credentials without triggering a connection
-// Used for lazy connection mode where connection is deferred until first Dial
+// SetCredentials stores credentials without triggering a connection.
+// Used for lazy connection mode where connection is deferred until first Dial.
 func (b *Backend) SetCredentials(creds aws.Credentials) {
-	b.credsMu.Lock()
-	b.credentials = creds
-	b.credsMu.Unlock()
+	b.credentials.Store(creds)
 }
 
-// OnCredentialUpdate handles credential refresh
+// OnCredentialUpdate handles credential refresh.
 func (b *Backend) OnCredentialUpdate(creds aws.Credentials) error {
-	b.credsMu.Lock()
-	b.credentials = creds
-	b.credsMu.Unlock()
+	b.credentials.Store(creds)
 
-	b.stateMu.Lock()
-	currentState := b.state
-	if currentState == StateIdle {
-		// Initial connection - start connecting
-		b.state = StateConnecting
-		b.stateMu.Unlock()
-		b.notifyStateChange()
-		go b.connect()
-		return nil
+	if b.getState() == StateIdle {
+		// CAS to atomically transition Idle → Connecting
+		if b.state.CompareAndSwap(int32(StateIdle), int32(StateConnecting)) {
+			b.setState(StateConnecting)
+			go b.connect()
+		}
 	}
-	// For StateActive: SSH connection doesn't need to reconnect on credential refresh
-	// The SSM session is already established and SSH uses the existing connection
-	// Only reconnect if the connection is actually broken (handled by isConnectionError)
-	b.stateMu.Unlock()
+	// For StateActive: SSH connection doesn't need to reconnect on credential refresh.
+	// The SSM session is already established and SSH uses the existing connection.
+	// Only reconnect if the connection is actually broken (handled by isConnectionError).
 	return nil
 }
 
@@ -323,10 +311,7 @@ func (b *Backend) OnCredentialUpdate(creds aws.Credentials) error {
 func (b *Backend) connectWithEC2Start() {
 	// EC2 auto-start if configured
 	if b.config.AutoStartEC2 && b.config.EC2Client != nil {
-		b.stateMu.Lock()
-		b.state = StateStartingEC2
-		b.stateMu.Unlock()
-		b.notifyStateChange()
+		b.setState(StateStartingEC2)
 
 		b.logInfo("Checking EC2 instance state for auto-start... instance=%s", b.config.InstanceID)
 
@@ -334,7 +319,7 @@ func (b *Backend) connectWithEC2Start() {
 		state, err := instMgr.GetInstanceState(b.ctx, b.config.InstanceID)
 		if err != nil {
 			b.logError("Failed to get instance state: %v", err)
-			b.setErrorState()
+			b.setState(StateError)
 			return
 		}
 
@@ -342,21 +327,18 @@ func (b *Backend) connectWithEC2Start() {
 			b.logInfo("Instance is stopped, starting... instance=%s", b.config.InstanceID)
 			if err := instMgr.StartAndWait(b.ctx, b.config.InstanceID, 5*time.Minute); err != nil {
 				b.logError("Failed to start instance: %v", err)
-				b.setErrorState()
+				b.setState(StateError)
 				return
 			}
 			b.logInfo("Instance is now running instance=%s", b.config.InstanceID)
 		}
 
-		b.stateMu.Lock()
-		b.state = StateConnecting
-		b.stateMu.Unlock()
-		b.notifyStateChange()
+		b.setState(StateConnecting)
 
 		// Wait for SSM agent to become online after EC2 start
 		if err := b.waitForSSMAgent(); err != nil {
 			b.logError("SSM agent not ready: %v", err)
-			b.setErrorState()
+			b.setState(StateError)
 			return
 		}
 	}
@@ -443,7 +425,7 @@ func (b *Backend) connect() {
 	}
 
 	b.logError("SSM connection failed after %d attempts", maxRetries)
-	b.setErrorState()
+	b.setState(StateError)
 }
 
 // tryConnect attempts a single connection
@@ -457,10 +439,7 @@ func (b *Backend) tryConnect() error {
 	b.logInfo("SSM session created sessionID=%s", session.SessionID)
 
 	// Update state to handshaking
-	b.stateMu.Lock()
-	b.state = StateHandshaking
-	b.stateMu.Unlock()
-	b.notifyStateChange()
+	b.setState(StateHandshaking)
 
 	// Open DataChannel
 	b.dataChannel = datachannel.NewDataChannel()
@@ -511,42 +490,47 @@ func (b *Backend) tryConnect() error {
 		b.logError("DataChannel error: %v", err)
 	})
 
-	// Set up net.Pipe bridge for SSH <-> DataChannel (with output callback)
-	if err := b.setupDataBridge(true); err != nil {
-		b.dataChannel.Close()
-		return fmt.Errorf("failed to setup data bridge: %w", err)
-	}
+	// Set up net.Pipe bridge for SSH <-> DataChannel
+	bridge, bridgeCtx := newDataBridge(b.ctx)
+	b.bridge = bridge
 
-	// Set temporary disconnect handler to interrupt SSH handshake.
-	// If WebSocket disconnects during SSH handshake, close the pipe to unblock ssh.NewClientConn.
+	// Set up DataChannel output callback: DataChannel → dcConn
+	// Capture bridge in closure to avoid nil-check races on b.bridge.
+	b.dataChannel.SetOnOutputData(func(data []byte) {
+		if _, err := bridge.dcConn.Write(data); err != nil {
+			select {
+			case <-b.ctx.Done():
+			default:
+				logger.Debug("DataChannel output write error", "error", err)
+			}
+		}
+	})
+
+	// Start transfer goroutine: dcConn → DataChannel
+	bridge.startTransfer(bridgeCtx, b.dataChannel, func(format string, args ...interface{}) {
+		logger.Debug(fmt.Sprintf(format, args...))
+	})
+
+	// Set unified disconnect handler that dispatches based on current state.
 	b.dataChannel.SetOnDisconnect(func() {
-		b.logWarn("DataChannel disconnected during SSH handshake")
-		b.cleanupDataBridge()
+		b.handleDisconnect()
 	})
 
 	// Establish SSH over the bridge (sshConn side of net.Pipe)
 	b.logInfo("Starting SSH handshake...")
 	if err := b.connectSSH(); err != nil {
-		b.cleanupDataBridge()
+		bridge.Close()
+		b.bridge = nil
 		b.dataChannel.Close()
 		return fmt.Errorf("failed to connect SSH: %w", err)
 	}
 	b.logInfo("SSH connection established")
 
-	// SSH handshake succeeded: replace disconnect handler with reconnect handler
-	b.dataChannel.SetOnDisconnect(func() {
-		b.logWarn("DataChannel disconnected, triggering reconnect...")
-		b.triggerReconnect()
-	})
-
 	// Wait a bit before accepting connections to let SSM stabilize
 	b.logDebug("Connection established, waiting for SSM to stabilize...")
 	time.Sleep(500 * time.Millisecond)
 
-	b.stateMu.Lock()
-	b.state = StateActive
-	b.stateMu.Unlock()
-	b.notifyStateChange()
+	b.setState(StateActive)
 	b.logInfo("Backend is now active")
 
 	// Start monitoring for connection loss and auto-reconnect
@@ -557,9 +541,7 @@ func (b *Backend) tryConnect() error {
 
 // startSSMSession creates a new SSM session
 func (b *Backend) startSSMSession() (*SSMSession, error) {
-	b.credsMu.RLock()
-	creds := b.credentials
-	b.credsMu.RUnlock()
+	creds, _ := b.credentials.Load().(aws.Credentials)
 
 	if b.ssmClient == nil {
 		return nil, fmt.Errorf("SSM client not configured")
@@ -568,102 +550,6 @@ func (b *Backend) startSSMSession() (*SSMSession, error) {
 	return StartSSMSession(b.ctx, b.ssmClient, b.config.InstanceID, b.config.Region, creds)
 }
 
-// setupDataBridge creates a net.Pipe() bridge between SSH and DataChannel
-// This serializes all writes through a single transfer loop, preventing
-// parallel writes that overwhelm the SSM agent.
-// If setupOutputCallback is true, also sets up the DataChannel output callback.
-func (b *Backend) setupDataBridge(setupOutputCallback bool) error {
-	// Create in-memory bidirectional pipe
-	b.sshConn, b.dcConn = net.Pipe()
-
-	// Start transfer loop for SSH -> DataChannel
-	go b.transferDataToSSM()
-
-	// Only set up output callback once (on initial setup, not on retry)
-	if setupOutputCallback {
-		b.setupDataChannelOutput()
-	}
-
-	return nil
-}
-
-// setupDataChannelOutput sets up the DataChannel -> SSH callback
-// This should only be called once per SSM session
-func (b *Backend) setupDataChannelOutput() {
-	b.dataChannel.SetOnOutputData(func(data []byte) {
-		if b.dcConn == nil {
-			return
-		}
-		if _, err := b.dcConn.Write(data); err != nil {
-			// Only log if not a normal pipe closure
-			select {
-			case <-b.ctx.Done():
-				// Context cancelled, ignore error
-			default:
-				logger.Debug("DataChannel output write error", "error", err)
-			}
-		}
-	})
-}
-
-// transferDataToSSM reads from dcConn (SSH writes) and sends to DataChannel
-// This is the critical serialization point - all SSH writes go through here
-func (b *Backend) transferDataToSSM() {
-	const chunkSize = 1024
-	buf := make([]byte, chunkSize)
-
-	for {
-		// Check if we're shutting down
-		select {
-		case <-b.ctx.Done():
-			return
-		default:
-		}
-
-		// Check if dcConn is still valid
-		if b.dcConn == nil {
-			return
-		}
-
-		n, err := b.dcConn.Read(buf)
-		if err != nil {
-			// Pipe closed or context cancelled - normal during shutdown
-			return
-		}
-
-		// Check if dataChannel is still valid
-		if b.dataChannel == nil {
-			return
-		}
-
-		if err := b.dataChannel.SendInputData(buf[:n]); err != nil {
-			// Only log if not shutting down
-			select {
-			case <-b.ctx.Done():
-				// Context cancelled, stop silently
-			default:
-				logger.Debug("transferDataToSSM error", "error", err)
-			}
-			return
-		}
-
-		// Rate limiting like the official plugin (1ms between sends)
-		time.Sleep(time.Millisecond)
-	}
-}
-
-
-// cleanupDataBridge closes the net.Pipe connections
-func (b *Backend) cleanupDataBridge() {
-	if b.sshConn != nil {
-		b.sshConn.Close()
-		b.sshConn = nil
-	}
-	if b.dcConn != nil {
-		b.dcConn.Close()
-		b.dcConn = nil
-	}
-}
 
 // connectSSH establishes SSH over the net.Pipe bridge
 // It retries SSH handshake with short intervals since SSM agent may not be ready immediately.
@@ -683,10 +569,12 @@ func (b *Backend) connectSSH() error {
 
 	var lastErr error
 	for attempt := 1; attempt <= sshMaxRetries; attempt++ {
+		bridge := b.bridge
+
 		// Run SSH handshake in a goroutine with timeout
 		resultCh := make(chan sshResult, 1)
 		go func() {
-			c, ch, r, err := ssh.NewClientConn(b.sshConn, "ssm:22", b.sshConfig)
+			c, ch, r, err := ssh.NewClientConn(bridge.sshConn, "ssm:22", b.sshConfig)
 			resultCh <- sshResult{c, ch, r, err}
 		}()
 
@@ -696,9 +584,7 @@ func (b *Backend) connectSSH() error {
 			timer.Stop()
 			if result.err == nil {
 				client := ssh.NewClient(result.conn, result.chans, result.reqs)
-				b.sshMu.Lock()
-				b.sshClient = client
-				b.sshMu.Unlock()
+				b.sshClient.Store(client)
 				if attempt > 1 {
 					b.logDebug("SSH handshake succeeded on attempt %d", attempt)
 				}
@@ -706,13 +592,13 @@ func (b *Backend) connectSSH() error {
 			}
 			lastErr = result.err
 		case <-timer.C:
-			// Timeout: close pipe to unblock the goroutine
-			b.cleanupDataBridge()
+			// Timeout: close bridge to unblock the goroutine
+			bridge.Close()
 			<-resultCh // wait for goroutine to finish (pipe closed, so it returns quickly)
 			lastErr = fmt.Errorf("SSH handshake timeout after %v", sshHandshakeTimeout)
 		case <-b.ctx.Done():
-			// Context cancelled: close pipe to unblock the goroutine
-			b.cleanupDataBridge()
+			// Context cancelled: close bridge to unblock the goroutine
+			bridge.Close()
 			<-resultCh
 			return b.ctx.Err()
 		}
@@ -721,12 +607,24 @@ func (b *Backend) connectSSH() error {
 			b.logDebug("SSH handshake attempt %d failed: %v, retrying...", attempt, lastErr)
 			time.Sleep(sshRetryInterval)
 
-			// Recreate the pipe for retry since SSH handshake corrupts the connection
-			// Pass false to not re-register the output callback (it's already set)
-			b.cleanupDataBridge()
-			if err := b.setupDataBridge(false); err != nil {
-				return fmt.Errorf("failed to recreate data bridge: %w", err)
-			}
+			// Recreate the bridge for retry since SSH handshake corrupts the connection.
+			// The DataChannel output callback is re-registered with the new bridge's dcConn.
+			newBridge, bridgeCtx := newDataBridge(b.ctx)
+			b.bridge = newBridge
+
+			b.dataChannel.SetOnOutputData(func(data []byte) {
+				if _, err := newBridge.dcConn.Write(data); err != nil {
+					select {
+					case <-b.ctx.Done():
+					default:
+						logger.Debug("DataChannel output write error", "error", err)
+					}
+				}
+			})
+
+			newBridge.startTransfer(bridgeCtx, b.dataChannel, func(format string, args ...interface{}) {
+				logger.Debug(fmt.Sprintf(format, args...))
+			})
 		}
 	}
 
@@ -735,10 +633,7 @@ func (b *Backend) connectSSH() error {
 
 // monitorConnection monitors the SSH connection and triggers reconnect on failure
 func (b *Backend) monitorConnection() {
-	b.sshMu.RLock()
-	client := b.sshClient
-	b.sshMu.RUnlock()
-
+	client := b.sshClient.Load()
 	if client == nil {
 		return
 	}
@@ -761,17 +656,36 @@ func (b *Backend) monitorConnection() {
 	b.triggerReconnect()
 }
 
-// triggerReconnect initiates a reconnection
+// handleDisconnect dispatches DataChannel disconnect events based on current state.
+// This replaces the pattern of swapping onDisconnect callbacks before/after SSH handshake.
+func (b *Backend) handleDisconnect() {
+	state := b.getState()
+	switch state {
+	case StateHandshaking:
+		b.logWarn("DataChannel disconnected during SSH handshake")
+		if b.bridge != nil {
+			b.bridge.Close()
+			b.bridge = nil
+		}
+	case StateActive:
+		b.logWarn("DataChannel disconnected, triggering reconnect...")
+		b.triggerReconnect()
+	default:
+		b.logDebug("DataChannel disconnected in state %s", state)
+	}
+}
+
+// triggerReconnect initiates a reconnection.
+// Uses CAS to ensure only one goroutine transitions to Reconnecting.
 func (b *Backend) triggerReconnect() {
-	b.stateMu.Lock()
-	if b.state == StateReconnecting || b.state == StateConnecting {
-		b.logDebug("Already reconnecting, skipping state=%s", b.state.String())
-		b.stateMu.Unlock()
+	// Only transition if not already reconnecting/connecting
+	currentState := b.getState()
+	if currentState == StateReconnecting || currentState == StateConnecting {
+		b.logDebug("Already reconnecting, skipping state=%s", currentState.String())
 		return
 	}
-	b.state = StateReconnecting
-	b.stateMu.Unlock()
-	b.notifyStateChange()
+
+	b.setState(StateReconnecting)
 
 	b.logDebug("Cleaning up old connection...")
 
@@ -784,44 +698,25 @@ func (b *Backend) triggerReconnect() {
 
 	// Reconnect
 	b.logInfo("Starting reconnection...")
-	b.stateMu.Lock()
-	b.state = StateConnecting
-	b.stateMu.Unlock()
-	b.notifyStateChange()
+	b.setState(StateConnecting)
 
 	go b.connect()
 }
 
 // cleanup closes all resources
 func (b *Backend) cleanup() {
-	b.sshMu.Lock()
-	if b.sshClient != nil {
-		b.sshClient.Close()
-		b.sshClient = nil
+	if client := b.sshClient.Swap(nil); client != nil {
+		client.Close()
 	}
-	b.sshMu.Unlock()
 
-	b.cleanupDataBridge()
+	if b.bridge != nil {
+		b.bridge.Close()
+		b.bridge = nil
+	}
 
 	if b.dataChannel != nil {
 		b.dataChannel.Close()
 		b.dataChannel = nil
-	}
-}
-
-// setErrorState sets the backend state to error
-func (b *Backend) setErrorState() {
-	b.stateMu.Lock()
-	b.state = StateError
-	b.stateMu.Unlock()
-	b.notifyStateChange()
-}
-
-// notifyStateChange signals that the state has changed
-func (b *Backend) notifyStateChange() {
-	select {
-	case b.stateChange <- struct{}{}:
-	default:
 	}
 }
 
@@ -836,11 +731,9 @@ func (b *Backend) Close() error {
 	return nil
 }
 
-// State returns the current state (for testing)
+// State returns the current state
 func (b *Backend) State() State {
-	b.stateMu.RLock()
-	defer b.stateMu.RUnlock()
-	return b.state
+	return b.getState()
 }
 
 // UpdateInstanceID updates the instance ID (used for lazy initialization when instance is resolved later)

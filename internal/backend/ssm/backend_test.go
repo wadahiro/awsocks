@@ -373,8 +373,8 @@ func useShortSSHTimeouts(t *testing.T) {
 	})
 }
 
-// newTestBackendWithPipe creates a Backend with net.Pipe set up for connectSSH testing.
-// Returns the backend and the remote side of the pipe (dcConn equivalent).
+// newTestBackendWithPipe creates a Backend with dataBridge set up for connectSSH testing.
+// Returns the backend and the dcConn side of the bridge (for external manipulation).
 func newTestBackendWithPipe(t *testing.T) (*Backend, net.Conn) {
 	t.Helper()
 	cfg := &Config{
@@ -392,15 +392,15 @@ func newTestBackendWithPipe(t *testing.T) (*Backend, net.Conn) {
 	b.cancel = cancel
 	b.sshConfig = newTestSSHConfig(t)
 
-	// Create net.Pipe manually (simulating setupDataBridge)
-	sshSide, dcSide := net.Pipe()
-	b.sshConn = sshSide
-	b.dcConn = dcSide
+	// Create dataBridge (simulating what tryConnect does)
+	bridge, _ := newDataBridge(ctx)
+	b.bridge = bridge
 
-	// Start the transfer goroutine (reads from dcSide, would send to DataChannel)
-	go b.transferDataToSSM()
+	// Note: transfer goroutine is not started because there's no DataChannel in unit tests.
+	// Close done channel so bridge.Close() won't block waiting for the goroutine.
+	close(bridge.done)
 
-	return b, dcSide
+	return b, bridge.dcConn
 }
 
 func TestConnectSSH_TimeoutWhenNoData(t *testing.T) {
@@ -437,9 +437,9 @@ func TestConnectSSH_PipeClosedReturnsError(t *testing.T) {
 		errCh <- b.connectSSH()
 	}()
 
-	// Close the pipe after a short delay to simulate onDisconnect handler
+	// Close the bridge after a short delay to simulate onDisconnect handler
 	time.Sleep(100 * time.Millisecond)
-	b.cleanupDataBridge()
+	b.bridge.Close()
 
 	select {
 	case err := <-errCh:
@@ -470,4 +470,57 @@ func TestConnectSSH_ContextCancelledReturnsError(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("connectSSH did not return after context was cancelled")
 	}
+}
+
+func TestHandleDisconnect_DuringHandshake(t *testing.T) {
+	cfg := &Config{
+		InstanceID: "i-test",
+		Region:     "ap-northeast-1",
+		SSHUser:    "ec2-user",
+	}
+	b := New(cfg, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b.ctx = ctx
+	b.cancel = cancel
+
+	// Set state to Handshaking
+	b.setState(StateHandshaking)
+	assert.Equal(t, StateHandshaking, b.State())
+
+	// Create a bridge so handleDisconnect has something to close
+	bridge, _ := newDataBridge(ctx)
+	b.bridge = bridge
+	close(bridge.done) // no transfer goroutine in test
+
+	// Call handleDisconnect
+	b.handleDisconnect()
+
+	// Bridge should be cleaned up (nil)
+	assert.Nil(t, b.bridge)
+}
+
+func TestHandleDisconnect_DuringActive(t *testing.T) {
+	cfg := &Config{
+		InstanceID: "i-test",
+		Region:     "ap-northeast-1",
+		SSHUser:    "ec2-user",
+	}
+	b := New(cfg, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	b.ctx = ctx
+	b.cancel = cancel
+
+	// Set state to Active
+	b.setState(StateActive)
+	assert.Equal(t, StateActive, b.State())
+
+	// Call handleDisconnect - should trigger reconnect (state → Reconnecting → Connecting)
+	b.handleDisconnect()
+
+	// State should be Connecting (triggerReconnect sets Reconnecting then Connecting)
+	state := b.State()
+	assert.True(t, state == StateConnecting || state == StateReconnecting,
+		"expected Connecting or Reconnecting, got %s", state)
 }
