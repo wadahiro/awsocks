@@ -442,20 +442,23 @@ func (b *Backend) tryConnect() error {
 	b.setState(StateHandshaking)
 
 	// Open DataChannel
-	b.dataChannel = datachannel.NewDataChannel()
+	// Capture in local variable to avoid nil pointer dereference if cleanup()
+	// runs concurrently (e.g., idle timeout calling Backend.Close()).
+	dc := datachannel.NewDataChannel()
+	b.dataChannel = dc
 	if b.config.DialContextFn != nil {
-		b.dataChannel.SetDialContextFn(b.config.DialContextFn)
+		dc.SetDialContextFn(b.config.DialContextFn)
 	}
-	b.dataChannel.SetClientVersion("1.0.0")
+	dc.SetClientVersion("1.0.0")
 
 	// Wait for handshake completion
 	handshakeDone := make(chan struct{})
-	b.dataChannel.SetOnHandshakeComplete(func() {
+	dc.SetOnHandshakeComplete(func() {
 		close(handshakeDone)
 	})
 
 	b.logInfo("Opening DataChannel WebSocket... streamURL=%s", session.StreamURL[:min(len(session.StreamURL), 80)])
-	if err := b.dataChannel.Open(b.ctx, session.StreamURL); err != nil {
+	if err := dc.Open(b.ctx, session.StreamURL); err != nil {
 		return fmt.Errorf("failed to open data channel: %w", err)
 	}
 	b.logInfo("DataChannel WebSocket connected")
@@ -466,8 +469,8 @@ func (b *Backend) tryConnect() error {
 		"RequestId":            session.SessionID,
 		"TokenValue":           session.TokenValue,
 	}
-	if err := b.dataChannel.SendJSON(openMsg); err != nil {
-		b.dataChannel.Close()
+	if err := dc.SendJSON(openMsg); err != nil {
+		dc.Close()
 		return fmt.Errorf("failed to send open message: %w", err)
 	}
 	b.logInfo("OpenDataChannel message sent, waiting for handshake...")
@@ -478,15 +481,15 @@ func (b *Backend) tryConnect() error {
 		// Handshake complete
 		b.logInfo("SSM handshake complete")
 	case <-time.After(30 * time.Second):
-		b.dataChannel.Close()
+		dc.Close()
 		return fmt.Errorf("handshake timeout")
 	case <-b.ctx.Done():
-		b.dataChannel.Close()
+		dc.Close()
 		return b.ctx.Err()
 	}
 
 	// Set up error handler for DataChannel
-	b.dataChannel.SetOnError(func(err error) {
+	dc.SetOnError(func(err error) {
 		b.logError("DataChannel error: %v", err)
 	})
 
@@ -496,7 +499,7 @@ func (b *Backend) tryConnect() error {
 
 	// Set up DataChannel output callback: DataChannel → dcConn
 	// Capture bridge in closure to avoid nil-check races on b.bridge.
-	b.dataChannel.SetOnOutputData(func(data []byte) {
+	dc.SetOnOutputData(func(data []byte) {
 		if _, err := bridge.dcConn.Write(data); err != nil {
 			select {
 			case <-b.ctx.Done():
@@ -507,21 +510,21 @@ func (b *Backend) tryConnect() error {
 	})
 
 	// Start transfer goroutine: dcConn → DataChannel
-	bridge.startTransfer(bridgeCtx, b.dataChannel, func(format string, args ...interface{}) {
+	bridge.startTransfer(bridgeCtx, dc, func(format string, args ...interface{}) {
 		logger.Debug(fmt.Sprintf(format, args...))
 	})
 
 	// Set unified disconnect handler that dispatches based on current state.
-	b.dataChannel.SetOnDisconnect(func() {
+	dc.SetOnDisconnect(func() {
 		b.handleDisconnect()
 	})
 
 	// Establish SSH over the bridge (sshConn side of net.Pipe)
 	b.logInfo("Starting SSH handshake...")
-	if err := b.connectSSH(); err != nil {
+	if err := b.connectSSH(dc); err != nil {
 		bridge.Close()
 		b.bridge = nil
-		b.dataChannel.Close()
+		dc.Close()
 		return fmt.Errorf("failed to connect SSH: %w", err)
 	}
 	b.logInfo("SSH connection established")
@@ -555,7 +558,7 @@ func (b *Backend) startSSMSession() (*SSMSession, error) {
 // It retries SSH handshake with short intervals since SSM agent may not be ready immediately.
 // Each attempt has a timeout to prevent hanging when the WebSocket disconnects
 // (net.Pipe does not support SetDeadline, so ssh.ClientConfig.Timeout is ineffective).
-func (b *Backend) connectSSH() error {
+func (b *Backend) connectSSH(dc *datachannel.DataChannel) error {
 	if b.sshConfig == nil {
 		return fmt.Errorf("SSH config not initialized")
 	}
@@ -612,7 +615,7 @@ func (b *Backend) connectSSH() error {
 			newBridge, bridgeCtx := newDataBridge(b.ctx)
 			b.bridge = newBridge
 
-			b.dataChannel.SetOnOutputData(func(data []byte) {
+			dc.SetOnOutputData(func(data []byte) {
 				if _, err := newBridge.dcConn.Write(data); err != nil {
 					select {
 					case <-b.ctx.Done():
@@ -622,7 +625,7 @@ func (b *Backend) connectSSH() error {
 				}
 			})
 
-			newBridge.startTransfer(bridgeCtx, b.dataChannel, func(format string, args ...interface{}) {
+			newBridge.startTransfer(bridgeCtx, dc, func(format string, args ...interface{}) {
 				logger.Debug(fmt.Sprintf(format, args...))
 			})
 		}

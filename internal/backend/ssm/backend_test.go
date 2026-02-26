@@ -13,6 +13,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
+	"github.com/wadahiro/awsocks/internal/backend/ssm/datachannel"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -413,7 +414,7 @@ func TestConnectSSH_TimeoutWhenNoData(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- b.connectSSH()
+		errCh <- b.connectSSH(b.dataChannel)
 	}()
 
 	select {
@@ -434,7 +435,7 @@ func TestConnectSSH_PipeClosedReturnsError(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- b.connectSSH()
+		errCh <- b.connectSSH(b.dataChannel)
 	}()
 
 	// Close the bridge after a short delay to simulate onDisconnect handler
@@ -457,7 +458,7 @@ func TestConnectSSH_ContextCancelledReturnsError(t *testing.T) {
 
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- b.connectSSH()
+		errCh <- b.connectSSH(b.dataChannel)
 	}()
 
 	// Cancel context after a short delay
@@ -470,6 +471,67 @@ func TestConnectSSH_ContextCancelledReturnsError(t *testing.T) {
 	case <-time.After(5 * time.Second):
 		t.Fatal("connectSSH did not return after context was cancelled")
 	}
+}
+
+func TestTryConnect_CleanupDuringSSHHandshake_NoPanic(t *testing.T) {
+	// Regression test for nil pointer dereference:
+	// When cleanup() runs concurrently (e.g., idle timeout calling Backend.Close())
+	// while connectSSH is in progress, b.dataChannel is set to nil.
+	// The error path in tryConnect must not panic when closing the data channel.
+	//
+	// Scenario:
+	// 1. connectSSH is running (SSH handshake in progress)
+	// 2. cleanup() sets b.dataChannel = nil
+	// 3. connectSSH returns error (context cancelled)
+	// 4. tryConnect error path calls dc.Close() via local variable (no panic)
+	useShortSSHTimeouts(t)
+
+	cfg := &Config{
+		InstanceID: "i-test",
+		Region:     "ap-northeast-1",
+		SSHUser:    "ec2-user",
+	}
+	b := New(cfg, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	b.ctx = ctx
+	b.cancel = cancel
+	b.sshConfig = newTestSSHConfig(t)
+
+	// Create a DataChannel and bridge (simulating what tryConnect sets up)
+	dc := datachannel.NewDataChannel()
+	b.dataChannel = dc
+
+	bridge, _ := newDataBridge(ctx)
+	b.bridge = bridge
+	close(bridge.done)
+
+	// Start connectSSH in a goroutine
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- b.connectSSH(dc)
+	}()
+
+	// Simulate idle timeout: cleanup() runs concurrently, setting b.dataChannel = nil
+	time.Sleep(50 * time.Millisecond)
+	b.cleanup()
+	assert.Nil(t, b.dataChannel, "cleanup should have set b.dataChannel to nil")
+
+	// Cancel context to unblock connectSSH
+	cancel()
+
+	select {
+	case err := <-errCh:
+		assert.Error(t, err)
+	case <-time.After(10 * time.Second):
+		t.Fatal("connectSSH did not return")
+	}
+
+	// Simulate the tryConnect error path: close dc via local variable.
+	// Before the fix, this would be b.dataChannel.Close() which panics because
+	// b.dataChannel is nil. With the fix, dc is a local variable still valid.
+	assert.NotPanics(t, func() {
+		dc.Close()
+	}, "closing DataChannel via local variable must not panic even after cleanup()")
 }
 
 func TestHandleDisconnect_DuringHandshake(t *testing.T) {
