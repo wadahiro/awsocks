@@ -721,6 +721,9 @@ func (b *Backend) handleDisconnect() {
 			bridge.Close()
 			b.bridge = nil
 		}
+		if dc := b.dataChannel; dc != nil {
+			dc.Close()
+		}
 	case StateActive:
 		b.logWarn("DataChannel disconnected, triggering reconnect...")
 		b.triggerReconnect()

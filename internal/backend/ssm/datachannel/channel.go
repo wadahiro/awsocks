@@ -552,6 +552,13 @@ func (d *DataChannel) startResendScheduler() {
 			case <-d.resendStopCh:
 				return
 			case <-ticker.C:
+				// Stop resending if the channel is closed or WebSocket is disconnected
+				d.mu.RLock()
+				closed := d.closed
+				d.mu.RUnlock()
+				if closed || !d.ws.IsOpen() {
+					return
+				}
 				d.checkAndResend()
 			}
 		}
@@ -602,7 +609,12 @@ func (d *DataChannel) checkAndResend() {
 
 	// Resend the message
 	if err := d.ws.SendMessage(msg.Content); err != nil {
-		dcLogger.Error("Failed to resend message", "error", err)
+		// If WebSocket is no longer open, stop resending silently
+		if !d.ws.IsOpen() {
+			dcLogger.Debug("Resend skipped, WebSocket closed", "error", err)
+			return
+		}
+		dcLogger.Debug("Failed to resend message", "error", err)
 		return
 	}
 
