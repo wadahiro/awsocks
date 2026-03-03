@@ -666,8 +666,8 @@ func (b *Backend) handleDisconnect() {
 	switch state {
 	case StateHandshaking:
 		b.logWarn("DataChannel disconnected during SSH handshake")
-		if b.bridge != nil {
-			b.bridge.Close()
+		if bridge := b.bridge; bridge != nil {
+			bridge.Close()
 			b.bridge = nil
 		}
 	case StateActive:
@@ -706,20 +706,22 @@ func (b *Backend) triggerReconnect() {
 	go b.connect()
 }
 
-// cleanup closes all resources
+// cleanup closes all resources.
+// Uses local variable capture to avoid TOCTOU race conditions when called
+// concurrently from multiple goroutines (e.g., triggerReconnect and Close).
 func (b *Backend) cleanup() {
 	if client := b.sshClient.Swap(nil); client != nil {
 		client.Close()
 	}
 
-	if b.bridge != nil {
-		b.bridge.Close()
+	if bridge := b.bridge; bridge != nil {
 		b.bridge = nil
+		bridge.Close()
 	}
 
-	if b.dataChannel != nil {
-		b.dataChannel.Close()
+	if dc := b.dataChannel; dc != nil {
 		b.dataChannel = nil
+		dc.Close()
 	}
 }
 
