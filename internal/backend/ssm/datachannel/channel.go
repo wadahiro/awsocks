@@ -560,6 +560,13 @@ func (d *DataChannel) startResendScheduler() {
 
 // checkAndResend checks the front message and resends if needed
 func (d *DataChannel) checkAndResend() {
+	d.mu.RLock()
+	closed := d.closed
+	d.mu.RUnlock()
+	if closed {
+		return
+	}
+
 	d.outgoingMu.Lock()
 	front := d.outgoingBuffer.Front()
 	if front == nil {

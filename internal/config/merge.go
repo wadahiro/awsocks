@@ -36,25 +36,30 @@ type CLIFlags struct {
 	RouteProxy    []string
 	RouteDirect   []string
 	RouteVMDirect []string
+
+	// SSH keepalive
+	SSHKeepalive      string
+	SSHKeepaliveIsSet bool
 }
 
 // MergedConfig represents the final merged configuration.
 type MergedConfig struct {
-	InstanceID       string
-	Name             string
-	AWSProfile       string
-	Region           string
-	SSHKey           string
-	SSHUser          string
-	SSHKeyPassphrase string
-	AutoStart        bool
-	AutoStop         bool
-	IdleTimeout      time.Duration
-	ProxyNetwork     string // "direct" (default) or "vm"
-	Listen           string
-	RemotePort       int
-	Lazy             bool
-	Routing          *RoutingConfig
+	InstanceID           string
+	Name                 string
+	AWSProfile           string
+	Region               string
+	SSHKey               string
+	SSHUser              string
+	SSHKeyPassphrase     string
+	AutoStart            bool
+	AutoStop             bool
+	IdleTimeout          time.Duration
+	ProxyNetwork         string // "direct" (default) or "vm"
+	Listen               string
+	RemotePort           int
+	Lazy                 bool
+	SSHKeepaliveInterval time.Duration
+	Routing              *RoutingConfig
 }
 
 // Built-in defaults used when no other configuration is provided.
@@ -74,11 +79,12 @@ func boolPtr(b bool) *bool {
 func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 	result := &MergedConfig{
 		// Start with built-in defaults
-		SSHUser:    builtInDefaults.SSHUser,
-		Listen:     builtInDefaults.Listen,
-		RemotePort: builtInDefaults.RemotePort,
-		Lazy:       true, // Default lazy to true
-		Routing:    &RoutingConfig{},
+		SSHUser:              builtInDefaults.SSHUser,
+		Listen:               builtInDefaults.Listen,
+		RemotePort:           builtInDefaults.RemotePort,
+		Lazy:                 true, // Default lazy to true
+		SSHKeepaliveInterval: 30 * time.Second,
+		Routing:              &RoutingConfig{},
 	}
 
 	// Apply file defaults
@@ -104,6 +110,11 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		if defaults.IdleTimeout != "" {
 			if d, err := time.ParseDuration(defaults.IdleTimeout); err == nil {
 				result.IdleTimeout = d
+			}
+		}
+		if defaults.SSHKeepalive != "" {
+			if d, err := time.ParseDuration(defaults.SSHKeepalive); err == nil {
+				result.SSHKeepaliveInterval = d
 			}
 		}
 	}
@@ -160,6 +171,11 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 				result.IdleTimeout = 0
 			}
 		}
+		if profile.SSHKeepalive != "" {
+			if d, err := time.ParseDuration(profile.SSHKeepalive); err == nil {
+				result.SSHKeepaliveInterval = d
+			}
+		}
 	}
 
 	// Apply CLI settings (highest priority)
@@ -202,6 +218,12 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		}
 		if cli.LazyIsSet {
 			result.Lazy = *cli.Lazy
+		}
+
+		if cli.SSHKeepaliveIsSet {
+			if d, err := time.ParseDuration(cli.SSHKeepalive); err == nil {
+				result.SSHKeepaliveInterval = d
+			}
 		}
 
 		// Apply CLI routing settings

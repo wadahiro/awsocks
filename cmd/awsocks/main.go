@@ -148,6 +148,10 @@ func main() {
 						Name:  "route-vm-direct",
 						Usage: "Patterns to route via VM NAT (can be specified multiple times)",
 					},
+					&cli.StringFlag{
+						Name:  "ssh-keepalive",
+						Usage: "SSH keepalive interval (e.g., \"30s\", \"0\" to disable)",
+					},
 					},
 				Action: startAction,
 			},
@@ -237,11 +241,12 @@ func startAction(c *cli.Context) error {
 		SSHUser:          merged.SSHUser,
 		SSHKeyPath:       merged.SSHKey,
 		SSHKeyPassphrase: merged.SSHKeyPassphrase,
-		AutoStart:        merged.AutoStart,
-		AutoStop:         merged.AutoStop,
-		RoutingConfig:    routingCfg,
-		LazyConnect:      merged.Lazy,
-		IdleTimeout:      merged.IdleTimeout,
+		AutoStart:            merged.AutoStart,
+		AutoStop:             merged.AutoStop,
+		RoutingConfig:        routingCfg,
+		LazyConnect:          merged.Lazy,
+		IdleTimeout:          merged.IdleTimeout,
+		SSHKeepaliveInterval: merged.SSHKeepaliveInterval,
 	}
 
 	// Validate VM requirements
@@ -384,6 +389,10 @@ func buildCLIFlags(c *cli.Context) *appconfig.CLIFlags {
 	}
 	if c.IsSet("route-vm-direct") {
 		cli.RouteVMDirect = c.StringSlice("route-vm-direct")
+	}
+	if c.IsSet("ssh-keepalive") {
+		cli.SSHKeepalive = c.String("ssh-keepalive")
+		cli.SSHKeepaliveIsSet = true
 	}
 
 	return cli

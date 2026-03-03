@@ -62,6 +62,9 @@ type Config struct {
 	SSHKeyPath  string
 	SSHPassword string
 
+	// SSH keepalive interval (0 to disable)
+	SSHKeepaliveInterval time.Duration
+
 	// EC2 auto-start settings (for lazy connection)
 	AutoStartEC2 bool          // Enable EC2 auto-start on first Dial
 	EC2Client    ec2pkg.Client // EC2 client for instance management (optional)
@@ -634,29 +637,77 @@ func (b *Backend) connectSSH(dc *datachannel.DataChannel) error {
 	return fmt.Errorf("SSH handshake failed after %d attempts: %w", sshMaxRetries, lastErr)
 }
 
-// monitorConnection monitors the SSH connection and triggers reconnect on failure
+// monitorConnection monitors the SSH connection and triggers reconnect on failure.
+// When SSHKeepaliveInterval > 0, it sends periodic SSH keepalive requests to prevent
+// idle WebSocket disconnections by network infrastructure (proxies/firewalls).
 func (b *Backend) monitorConnection() {
 	client := b.sshClient.Load()
 	if client == nil {
 		return
 	}
 
-	// Wait for the SSH connection to close
-	// This blocks until the underlying connection is closed
-	err := client.Wait()
+	// Monitor SSH connection close in a separate goroutine
+	disconnectCh := make(chan error, 1)
+	go func() {
+		disconnectCh <- client.Wait()
+	}()
 
-	// Check if we're still supposed to be running
-	select {
-	case <-b.ctx.Done():
-		// Context cancelled, don't reconnect
-		b.logDebug("SSH connection closed (context cancelled)")
-		return
-	default:
+	interval := b.config.SSHKeepaliveInterval
+	if interval <= 0 {
+		// No keepalive: just wait for disconnect
+		select {
+		case <-b.ctx.Done():
+			b.logDebug("SSH connection closed (context cancelled)")
+			return
+		case err := <-disconnectCh:
+			b.logWarn("SSH connection lost, will reconnect... error=%v", err)
+			b.triggerReconnect()
+			return
+		}
 	}
 
-	// Connection lost - trigger reconnect
-	b.logWarn("SSH connection lost, will reconnect... error=%v", err)
-	b.triggerReconnect()
+	// Keepalive enabled
+	b.logInfo("SSH keepalive enabled interval=%v", interval)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	const keepaliveTimeout = 15 * time.Second
+
+	for {
+		select {
+		case <-b.ctx.Done():
+			b.logDebug("SSH connection closed (context cancelled)")
+			return
+		case err := <-disconnectCh:
+			b.logWarn("SSH connection lost, will reconnect... error=%v", err)
+			b.triggerReconnect()
+			return
+		case <-ticker.C:
+			// Send keepalive request with timeout
+			replyCh := make(chan error, 1)
+			go func() {
+				_, _, err := client.SendRequest("keepalive@openssh.com", true, nil)
+				replyCh <- err
+			}()
+
+			select {
+			case <-b.ctx.Done():
+				b.logDebug("SSH connection closed during keepalive (context cancelled)")
+				return
+			case err := <-replyCh:
+				if err != nil {
+					b.logWarn("SSH keepalive failed, connection dead error=%v", err)
+					b.triggerReconnect()
+					return
+				}
+				b.logDebug("SSH keepalive ok")
+			case <-time.After(keepaliveTimeout):
+				b.logWarn("SSH keepalive timeout after %v, connection dead", keepaliveTimeout)
+				b.triggerReconnect()
+				return
+			}
+		}
+	}
 }
 
 // handleDisconnect dispatches DataChannel disconnect events based on current state.

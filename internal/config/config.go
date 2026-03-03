@@ -43,18 +43,22 @@ type Profile struct {
 	RemotePort  int    `toml:"remote-port"`
 	Lazy        *bool  `toml:"lazy"`
 
+	// SSH keepalive
+	SSHKeepalive string `toml:"ssh-keepalive"` // e.g., "30s", "0" to disable
+
 	// Routing configuration
 	Routing *RoutingConfig `toml:"routing"`
 }
 
 // Defaults holds default values that apply when not specified in a profile.
 type Defaults struct {
-	SSHUser     string `toml:"ssh-user"`
-	Listen      string `toml:"listen"`
+	SSHUser      string `toml:"ssh-user"`
+	Listen       string `toml:"listen"`
 	ProxyNetwork string `toml:"proxy-network"` // "direct" (default) or "vm"
-	RemotePort  int    `toml:"remote-port"`
-	Lazy        *bool  `toml:"lazy"`
-	IdleTimeout string `toml:"idle-timeout"` // e.g., "30m", "1h"
+	RemotePort   int    `toml:"remote-port"`
+	Lazy         *bool  `toml:"lazy"`
+	IdleTimeout  string `toml:"idle-timeout"`  // e.g., "30m", "1h"
+	SSHKeepalive string `toml:"ssh-keepalive"` // e.g., "30s", "0" to disable
 
 	// Default routing configuration
 	Routing *RoutingConfig `toml:"routing"`

@@ -48,6 +48,9 @@ type Config struct {
 	// Idle timeout settings
 	IdleTimeout time.Duration
 
+	// SSH keepalive interval (0 to disable)
+	SSHKeepaliveInterval time.Duration
+
 	// Proxy network: "direct" (default) or "vm"
 	ProxyNetwork string
 }
@@ -77,10 +80,11 @@ type Manager struct {
 	cancel             context.CancelFunc
 
 	// Lazy initialization state
-	awsInitialized bool
-	awsInitMu      sync.Mutex
-	initDone       chan struct{}
-	initErr        error
+	awsInitialized   bool
+	awsInitMu        sync.Mutex
+	initDone         chan struct{}
+	initErr          error
+	initializeProxyFn func(ctx context.Context) error // override for testing
 }
 
 // NewManager creates a new proxy manager
@@ -319,11 +323,12 @@ func (m *Manager) initializeProxy(ctx context.Context) error {
 	// Create and start SSM backend
 	if instanceID != "" {
 		backendCfg := &awsapi.SSMBackendConfig{
-			InstanceID:   instanceID,
-			Region:       m.cfg.Region,
-			SSHUser:      m.cfg.SSHUser,
-			SSHKeyPath:   m.cfg.SSHKeyPath,
-			AutoStartEC2: m.cfg.AutoStart,
+			InstanceID:           instanceID,
+			Region:               m.cfg.Region,
+			SSHUser:              m.cfg.SSHUser,
+			SSHKeyPath:           m.cfg.SSHKeyPath,
+			AutoStartEC2:         m.cfg.AutoStart,
+			SSHKeepaliveInterval: m.cfg.SSHKeepaliveInterval,
 		}
 
 		ssmBe := m.awsClient.NewSSMBackend(backendCfg)
@@ -362,7 +367,11 @@ func (m *Manager) EnsureInitialized(ctx context.Context) error {
 
 	logger.Info("Lazy initialization: starting AWS credential and instance resolution...")
 
-	if err := m.initializeProxy(ctx); err != nil {
+	initFn := m.initializeProxy
+	if m.initializeProxyFn != nil {
+		initFn = m.initializeProxyFn
+	}
+	if err := initFn(ctx); err != nil {
 		// Cleanup credential provider to avoid leaking watchers on retry
 		if m.credProv != nil {
 			m.credProv.Stop()

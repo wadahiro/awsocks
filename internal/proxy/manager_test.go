@@ -12,7 +12,6 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"github.com/wadahiro/awsocks/internal/clock"
-	"github.com/wadahiro/awsocks/internal/credentials"
 	"github.com/wadahiro/awsocks/internal/routing"
 )
 
@@ -431,7 +430,9 @@ func TestManager_EnsureInitialized_ErrorThenRetry_NoPanic(t *testing.T) {
 		clock:    clock.RealClock{},
 		ctx:      ctx,
 		cancel:   cancel,
-		credProv: credentials.NewProvider("nonexistent-profile-for-test", "us-east-1"),
+		initializeProxyFn: func(ctx context.Context) error {
+			return fmt.Errorf("mock initialization error")
+		},
 	}
 
 	err1 := mgr.EnsureInitialized(context.Background())
@@ -457,7 +458,9 @@ func TestManager_EnsureInitialized_ConcurrentAfterSuspend_NoPanic(t *testing.T) 
 		clock:    clock.RealClock{},
 		ctx:      ctx,
 		cancel:   cancel,
-		credProv: credentials.NewProvider("nonexistent-profile-for-test", "us-east-1"),
+		initializeProxyFn: func(ctx context.Context) error {
+			return fmt.Errorf("mock initialization error")
+		},
 	}
 
 	const goroutines = 5

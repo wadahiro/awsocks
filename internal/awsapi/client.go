@@ -143,20 +143,22 @@ func (c *Client) WaitForSSMAgent(ctx context.Context, instanceID string, timeout
 
 // SSMBackendConfig holds configuration for creating a new SSM backend.
 type SSMBackendConfig struct {
-	InstanceID   string
-	Region       string
-	SSHUser      string
-	SSHKeyPath   string
-	AutoStartEC2 bool
+	InstanceID           string
+	Region               string
+	SSHUser              string
+	SSHKeyPath           string
+	AutoStartEC2         bool
+	SSHKeepaliveInterval time.Duration
 }
 
 // NewSSMBackend creates a new SSM backend with the client's dial function injected.
 func (c *Client) NewSSMBackend(cfg *SSMBackendConfig) *ssmbackend.Backend {
 	backendConfig := &ssmbackend.Config{
-		InstanceID:  cfg.InstanceID,
-		Region:      cfg.Region,
-		SSHUser:     cfg.SSHUser,
-		SSHKeyPath:  cfg.SSHKeyPath,
+		InstanceID:           cfg.InstanceID,
+		Region:               cfg.Region,
+		SSHUser:              cfg.SSHUser,
+		SSHKeyPath:           cfg.SSHKeyPath,
+		SSHKeepaliveInterval: cfg.SSHKeepaliveInterval,
 	}
 
 	if cfg.AutoStartEC2 {
