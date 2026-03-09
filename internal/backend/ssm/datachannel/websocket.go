@@ -163,7 +163,10 @@ func (w *WebSocketChannel) StartReceiving() {
 
 		_, data, err := conn.ReadMessage()
 		if err != nil {
-			// Connection closed or error
+			// Mark as closed so SendMessage returns immediately
+			w.mu.Lock()
+			w.closed = true
+			w.mu.Unlock()
 			wsLogger.Debug("ReadMessage error", "error", err)
 			return
 		}

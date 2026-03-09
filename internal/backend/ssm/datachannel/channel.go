@@ -47,8 +47,9 @@ type DataChannel struct {
 	onDisconnect         func()
 	onResendTimeout      func()
 
-	// State
-	closed               bool
+	// Lifecycle context: cancelling stops all goroutines (resend, receiver)
+	ctx    context.Context
+	cancel context.CancelFunc
 
 	// Retransmission mechanism
 	outgoingBuffer            *list.List
@@ -56,7 +57,6 @@ type DataChannel struct {
 	roundTripTime             float64 // in milliseconds
 	roundTripTimeVariation    float64 // in milliseconds
 	retransmissionTimeout     time.Duration
-	resendStopCh              chan struct{}
 }
 
 // pendingMessage tracks a sent message awaiting acknowledgment
@@ -77,7 +77,6 @@ func NewDataChannel() *DataChannel {
 		roundTripTime:           DefaultRoundTripTime,
 		roundTripTimeVariation:  DefaultRoundTripTimeVariation,
 		retransmissionTimeout:   DefaultTransmissionTimeout,
-		resendStopCh:            make(chan struct{}),
 	}
 }
 
@@ -89,12 +88,11 @@ func (d *DataChannel) SetDialContextFn(fn DialContextFunc) {
 // Open opens the data channel
 func (d *DataChannel) Open(ctx context.Context, url string) error {
 	d.mu.Lock()
-	d.closed = false
+	d.ctx, d.cancel = context.WithCancel(ctx)
 	d.handshakeProcessor = NewHandshakeProcessor(d.clientVersion)
-	d.resendStopCh = make(chan struct{})
 	d.mu.Unlock()
 
-	if err := d.ws.Open(ctx, url); err != nil {
+	if err := d.ws.Open(d.ctx, url); err != nil {
 		return err
 	}
 
@@ -116,10 +114,9 @@ func (d *DataChannel) Open(ctx context.Context, url string) error {
 		// When StartReceiving returns, the WebSocket connection is closed
 		d.mu.RLock()
 		onDisconnect := d.onDisconnect
-		closed := d.closed
 		d.mu.RUnlock()
-		// Only call onDisconnect if not intentionally closed
-		if onDisconnect != nil && !closed {
+		// Only call onDisconnect if not intentionally closed (context cancelled = intentional)
+		if onDisconnect != nil && d.ctx.Err() == nil {
 			onDisconnect()
 		}
 	}()
@@ -132,25 +129,15 @@ func (d *DataChannel) Open(ctx context.Context, url string) error {
 
 // Close closes the data channel
 func (d *DataChannel) Close() error {
-	d.mu.Lock()
-	d.closed = true
-	// Stop resend scheduler
-	select {
-	case <-d.resendStopCh:
-		// Already closed
-	default:
-		close(d.resendStopCh)
+	if d.cancel != nil {
+		d.cancel() // Signal all goroutines (resend scheduler, receiver) to stop
 	}
-	d.mu.Unlock()
-
 	return d.ws.Close()
 }
 
 // IsOpen returns whether the channel is open
 func (d *DataChannel) IsOpen() bool {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	return !d.closed && d.ws.IsOpen()
+	return d.ctx != nil && d.ctx.Err() == nil && d.ws.IsOpen()
 }
 
 // SetClientVersion sets the client version for handshake
@@ -549,16 +536,9 @@ func (d *DataChannel) startResendScheduler() {
 
 		for {
 			select {
-			case <-d.resendStopCh:
+			case <-d.ctx.Done():
 				return
 			case <-ticker.C:
-				// Stop resending if the channel is closed or WebSocket is disconnected
-				d.mu.RLock()
-				closed := d.closed
-				d.mu.RUnlock()
-				if closed || !d.ws.IsOpen() {
-					return
-				}
 				d.checkAndResend()
 			}
 		}
@@ -567,10 +547,7 @@ func (d *DataChannel) startResendScheduler() {
 
 // checkAndResend checks the front message and resends if needed
 func (d *DataChannel) checkAndResend() {
-	d.mu.RLock()
-	closed := d.closed
-	d.mu.RUnlock()
-	if closed {
+	if d.ctx.Err() != nil {
 		return
 	}
 
@@ -609,9 +586,7 @@ func (d *DataChannel) checkAndResend() {
 
 	// Resend the message
 	if err := d.ws.SendMessage(msg.Content); err != nil {
-		// If WebSocket is no longer open, stop resending silently
-		if !d.ws.IsOpen() {
-			dcLogger.Debug("Resend skipped, WebSocket closed", "error", err)
+		if d.ctx.Err() != nil {
 			return
 		}
 		dcLogger.Debug("Failed to resend message", "error", err)

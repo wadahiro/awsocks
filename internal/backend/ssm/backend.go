@@ -460,6 +460,12 @@ func (b *Backend) tryConnect() error {
 		close(handshakeDone)
 	})
 
+	// Set disconnect handler before Open() to avoid race window where
+	// goroutines start but handler is not yet registered.
+	dc.SetOnDisconnect(func() {
+		b.handleDisconnect()
+	})
+
 	b.logInfo("Opening DataChannel WebSocket... streamURL=%s", session.StreamURL[:min(len(session.StreamURL), 80)])
 	if err := dc.Open(b.ctx, session.StreamURL); err != nil {
 		return fmt.Errorf("failed to open data channel: %w", err)
@@ -515,11 +521,6 @@ func (b *Backend) tryConnect() error {
 	// Start transfer goroutine: dcConn → DataChannel
 	bridge.startTransfer(bridgeCtx, dc, func(format string, args ...interface{}) {
 		logger.Debug(fmt.Sprintf(format, args...))
-	})
-
-	// Set unified disconnect handler that dispatches based on current state.
-	dc.SetOnDisconnect(func() {
-		b.handleDisconnect()
 	})
 
 	// Establish SSH over the bridge (sshConn side of net.Pipe)
