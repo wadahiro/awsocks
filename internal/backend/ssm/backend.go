@@ -456,8 +456,9 @@ func (b *Backend) tryConnect() error {
 
 	// Wait for handshake completion
 	handshakeDone := make(chan struct{})
+	var handshakeOnce sync.Once
 	dc.SetOnHandshakeComplete(func() {
-		close(handshakeDone)
+		handshakeOnce.Do(func() { close(handshakeDone) })
 	})
 
 	// Set disconnect handler before Open() to avoid race window where
