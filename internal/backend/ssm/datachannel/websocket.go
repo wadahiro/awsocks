@@ -2,6 +2,7 @@ package datachannel
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net"
 	"net/http"
@@ -167,7 +168,12 @@ func (w *WebSocketChannel) StartReceiving() {
 			w.mu.Lock()
 			w.closed = true
 			w.mu.Unlock()
-			wsLogger.Debug("ReadMessage error", "error", err)
+			var closeErr *websocket.CloseError
+			if errors.As(err, &closeErr) {
+				wsLogger.Warn("WebSocket closed by peer", "code", closeErr.Code, "reason", closeErr.Text)
+			} else {
+				wsLogger.Warn("WebSocket ReadMessage error", "error", err)
+			}
 			return
 		}
 

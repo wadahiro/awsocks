@@ -267,7 +267,7 @@ func (d *DataChannel) ProcessMessage(data []byte) error {
 		// Input from agent (handshake, etc.)
 		return d.processInputMessage(msg)
 	case ChannelClosedMessage:
-		dcLogger.Debug("Received ChannelClosedMessage from SSM, closing connection", "seq", msg.SequenceNumber, "payload", string(msg.Payload))
+		dcLogger.Warn("Received ChannelClosedMessage from SSM", "seq", msg.SequenceNumber, "payload", string(msg.Payload))
 		return d.Close()
 	default:
 		// Unknown message type - ignore

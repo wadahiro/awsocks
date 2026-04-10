@@ -612,6 +612,13 @@ func (b *Backend) connectSSH(dc *datachannel.DataChannel) error {
 		}
 
 		if attempt < sshMaxRetries {
+			// Abort retries if DataChannel is already closed (e.g., WebSocket disconnected
+			// during handshake). Without this check, each retry would wait for the full
+			// sshHandshakeTimeout since no SSH response can arrive over a dead channel.
+			if !dc.IsOpen() {
+				return fmt.Errorf("DataChannel closed during SSH handshake")
+			}
+
 			b.logDebug("SSH handshake attempt %d failed: %v, retrying...", attempt, lastErr)
 			time.Sleep(sshRetryInterval)
 
