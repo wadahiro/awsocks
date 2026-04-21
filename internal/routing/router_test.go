@@ -301,3 +301,35 @@ func TestDefaultRouter_WithoutVMMode_FallbackRoute(t *testing.T) {
 	assert.Equal(t, RouteDirect, router.FallbackRoute(RouteProxy))
 	assert.Equal(t, RouteProxy, router.FallbackRoute(RouteDirect))
 }
+
+func TestRouter_ResolveHost(t *testing.T) {
+	tests := []struct {
+		name string
+		hosts map[string]string
+		host  string
+		want  string
+	}{
+		{"mapped host", map[string]string{"api.internal": "10.0.1.50"}, "api.internal", "10.0.1.50"},
+		{"unmapped host", map[string]string{"api.internal": "10.0.1.50"}, "other.internal", "other.internal"},
+		{"case insensitive", map[string]string{"API.Internal": "10.0.1.50"}, "api.internal", "10.0.1.50"},
+		{"empty hosts", map[string]string{}, "api.internal", "api.internal"},
+		{"nil hosts", nil, "api.internal", "api.internal"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &Config{
+				Default: "proxy",
+				Hosts:   tt.hosts,
+			}
+			router := NewRouter(cfg)
+			assert.Equal(t, tt.want, router.ResolveHost(tt.host))
+		})
+	}
+}
+
+func TestDefaultRouter_ResolveHost(t *testing.T) {
+	router := NewDefaultRouter()
+	// DefaultRouter should return host as-is (no hosts mapping)
+	assert.Equal(t, "api.internal", router.ResolveHost("api.internal"))
+}

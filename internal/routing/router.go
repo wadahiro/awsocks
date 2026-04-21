@@ -1,6 +1,8 @@
 package routing
 
 import (
+	"strings"
+
 	"github.com/wadahiro/awsocks/internal/log"
 )
 
@@ -13,15 +15,19 @@ type Router interface {
 	// FallbackRoute returns the fallback route for the given route.
 	// Returns empty string if no fallback is available.
 	FallbackRoute(current Route) Route
+	// ResolveHost returns the mapped address for the given host.
+	// If no mapping exists, returns the original host unchanged.
+	ResolveHost(host string) string
 }
 
 // DefaultRouter implements Router with pattern-based routing rules
 type DefaultRouter struct {
-	defaultRoute   Route
-	proxyMatchers  []Matcher
-	directMatchers []Matcher
+	defaultRoute     Route
+	proxyMatchers    []Matcher
+	directMatchers   []Matcher
 	vmDirectMatchers []Matcher
-	vmModeEnabled  bool
+	vmModeEnabled    bool
+	hosts            map[string]string // lowercase hostname -> address
 }
 
 // RouterOption configures the router
@@ -58,6 +64,14 @@ func NewRouter(cfg *Config, opts ...RouterOption) *DefaultRouter {
 	if r.vmModeEnabled {
 		for _, pattern := range cfg.VMDirect {
 			r.vmDirectMatchers = append(r.vmDirectMatchers, ParseMatcher(pattern))
+		}
+	}
+
+	// Build hosts mapping (normalized to lowercase)
+	if len(cfg.Hosts) > 0 {
+		r.hosts = make(map[string]string, len(cfg.Hosts))
+		for hostname, addr := range cfg.Hosts {
+			r.hosts[strings.ToLower(hostname)] = addr
 		}
 	}
 
@@ -111,6 +125,19 @@ func (r *DefaultRouter) Route(host string) Route {
 // DefaultRoute returns the default route
 func (r *DefaultRouter) DefaultRoute() Route {
 	return r.defaultRoute
+}
+
+// ResolveHost returns the mapped address for the given host.
+// If no mapping exists, returns the original host unchanged.
+func (r *DefaultRouter) ResolveHost(host string) string {
+	if len(r.hosts) == 0 {
+		return host
+	}
+	if addr, ok := r.hosts[strings.ToLower(host)]; ok {
+		logger.Debug("Host resolved via hosts mapping", "host", host, "resolved", addr)
+		return addr
+	}
+	return host
 }
 
 // HasVMDirectRoutes returns true if any vm-direct routes are configured

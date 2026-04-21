@@ -358,6 +358,32 @@ func TestMerge_ProxyNetwork(t *testing.T) {
 	}
 }
 
+func TestMerge_RoutingHostsMerged(t *testing.T) {
+	defaults := &Defaults{
+		Routing: &RoutingConfig{
+			Hosts: map[string]string{
+				"api.internal": "10.0.1.50",
+				"db.internal":  "10.0.1.51",
+			},
+		},
+	}
+	profile := &Profile{
+		Routing: &RoutingConfig{
+			Hosts: map[string]string{
+				"db.internal":  "10.0.2.100", // override defaults
+				"web.internal": "10.0.2.200",
+			},
+		},
+	}
+	cli := &CLIFlags{}
+
+	result := Merge(defaults, profile, cli)
+
+	assert.Equal(t, "10.0.1.50", result.Routing.Hosts["api.internal"])   // from defaults
+	assert.Equal(t, "10.0.2.100", result.Routing.Hosts["db.internal"])   // profile overrides
+	assert.Equal(t, "10.0.2.200", result.Routing.Hosts["web.internal"]) // from profile
+}
+
 func TestMerge_SSHKeyPassphrase(t *testing.T) {
 	profile := &Profile{
 		SSHKeyPassphrase: "profile-pass",

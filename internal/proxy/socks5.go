@@ -196,15 +196,29 @@ func (s *SOCKS5Server) isInitialized() bool {
 
 // dial is the unified dial function for all route types
 func (s *SOCKS5Server) dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	host, _, err := net.SplitHostPort(addr)
+	host, port, err := net.SplitHostPort(addr)
 	if err != nil {
 		host = addr
 	}
 
-	// Determine route
+	// Determine route using the original hostname
 	route := routing.RouteProxy
 	if s.router != nil {
 		route = s.router.Route(host)
+	}
+
+	// Apply hosts mapping after routing decision (so routing matches on original hostname)
+	if s.router != nil {
+		resolved := s.router.ResolveHost(host)
+		if resolved != host {
+			proxyLogger.Info("Host resolved via hosts mapping", "original", host, "resolved", resolved)
+			host = resolved
+			if port != "" {
+				addr = net.JoinHostPort(host, port)
+			} else {
+				addr = host
+			}
+		}
 	}
 
 	// For direct route, connect directly (no need to wait for initialization)

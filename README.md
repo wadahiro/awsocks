@@ -107,6 +107,9 @@ ssh-key = "~/.ssh/id_ed25519"
 
 [profiles.staging.routing]
 proxy = ["*.internal.example.com", "*.staging.example.com"]
+
+[profiles.staging.routing.hosts]
+"api.internal.example.com" = "10.0.1.50"
 ```
 
 ### Defaults
@@ -128,6 +131,22 @@ Routes determine how traffic is handled:
 | `proxy` | Route through EC2 via SSM |
 | `direct` | Direct connection from host (bypass proxy) |
 | `vm-direct` | Direct from VM NAT (VM mode only) |
+
+#### Hosts Mapping
+
+When using SOCKS5h (remote DNS resolution), the EC2 instance may not be able to resolve certain hostnames. The `hosts` setting provides `/etc/hosts`-style hostname-to-IP mapping without modifying the EC2 instance:
+
+```toml
+[defaults.routing.hosts]
+"api.prod.internal" = "10.0.1.50"
+"db.prod.internal" = "10.0.1.51"
+
+# Per-profile overrides
+[profiles.dev.routing.hosts]
+"api.prod.internal" = "10.0.2.50"
+```
+
+Routing decisions are made using the original hostname, then the resolved IP is used for the actual connection.
 
 ## CLI Reference
 

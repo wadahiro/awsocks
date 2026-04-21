@@ -66,10 +66,11 @@ type Defaults struct {
 
 // RoutingConfig defines how traffic is routed based on destination patterns.
 type RoutingConfig struct {
-	Default  string   `toml:"default"`
-	Proxy    []string `toml:"proxy"`
-	Direct   []string `toml:"direct"`
-	VMDirect []string `toml:"vm-direct"`
+	Default  string            `toml:"default"`
+	Proxy    []string          `toml:"proxy"`
+	Direct   []string          `toml:"direct"`
+	VMDirect []string          `toml:"vm-direct"`
+	Hosts    map[string]string `toml:"hosts"`
 }
 
 // LoadConfig loads configuration from the specified path.

@@ -156,6 +156,10 @@ func (r *mockRouter) FallbackRoute(current routing.Route) routing.Route {
 	return r.fallbackRoute
 }
 
+func (r *mockRouter) ResolveHost(host string) string {
+	return host
+}
+
 func TestSOCKS5Server_dial_RouteProxy_WaitsForInit(t *testing.T) {
 	agentServer, agentClient := net.Pipe()
 	defer agentServer.Close()

@@ -240,6 +240,7 @@ func mergeRoutingFromDefaults(src *RoutingConfig) *RoutingConfig {
 		Proxy:    copySlice(src.Proxy),
 		Direct:   copySlice(src.Direct),
 		VMDirect: copySlice(src.VMDirect),
+		Hosts:    copyMap(src.Hosts),
 	}
 }
 
@@ -250,6 +251,7 @@ func mergeRoutingFromProfile(base *RoutingConfig, profile *RoutingConfig) *Routi
 		Proxy:    copySlice(base.Proxy),
 		Direct:   copySlice(base.Direct),
 		VMDirect: copySlice(base.VMDirect),
+		Hosts:    copyMap(base.Hosts),
 	}
 
 	if profile.Default != "" {
@@ -261,6 +263,9 @@ func mergeRoutingFromProfile(base *RoutingConfig, profile *RoutingConfig) *Routi
 	result.Direct = mergeStringSlices(result.Direct, profile.Direct)
 	result.VMDirect = mergeStringSlices(result.VMDirect, profile.VMDirect)
 
+	// Merge hosts (profile overrides base)
+	result.Hosts = mergeMaps(result.Hosts, profile.Hosts)
+
 	return result
 }
 
@@ -271,6 +276,7 @@ func mergeRoutingFromCLI(base *RoutingConfig, cli *CLIFlags) *RoutingConfig {
 		Proxy:    copySlice(base.Proxy),
 		Direct:   copySlice(base.Direct),
 		VMDirect: copySlice(base.VMDirect),
+		Hosts:    copyMap(base.Hosts),
 	}
 
 	if cli.RouteDefault != "" {
@@ -292,6 +298,33 @@ func copySlice(src []string) []string {
 	}
 	result := make([]string, len(src))
 	copy(result, src)
+	return result
+}
+
+// copyMap creates a copy of a string map.
+func copyMap(src map[string]string) map[string]string {
+	if src == nil {
+		return nil
+	}
+	result := make(map[string]string, len(src))
+	for k, v := range src {
+		result[k] = v
+	}
+	return result
+}
+
+// mergeMaps merges two maps. Values in additional override base.
+func mergeMaps(base, additional map[string]string) map[string]string {
+	if len(additional) == 0 {
+		return base
+	}
+	if base == nil {
+		return copyMap(additional)
+	}
+	result := copyMap(base)
+	for k, v := range additional {
+		result[k] = v
+	}
 	return result
 }
 
