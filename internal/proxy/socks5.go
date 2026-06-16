@@ -8,10 +8,8 @@ import (
 	"net"
 	"strings"
 	"sync"
-	"time"
 
 	gosocks5 "github.com/armon/go-socks5"
-	"github.com/wadahiro/awsocks/internal/backend"
 	"github.com/wadahiro/awsocks/internal/log"
 	"github.com/wadahiro/awsocks/internal/mux"
 	"github.com/wadahiro/awsocks/internal/routing"
@@ -78,78 +76,65 @@ func (r *noopResolver) Resolve(ctx context.Context, name string) (context.Contex
 // - RouteVMDirect: connects via AgentMux using MsgConnectDirect protocol
 // - RouteProxy: connects via SSM backend's Dial()
 type SOCKS5Server struct {
-	cfg             *Config
-	router          routing.Router
-	backend         backend.Backend // proxy route (may be nil)
-	backendMu       sync.RWMutex
-	dialer          Dialer // For testing without full backend
-	agentMux        *mux.AgentMux  // shared multiplexer (may be nil)
-	ctx             context.Context
-	cancel          context.CancelFunc
-	listener        net.Listener
-	listenerMu      sync.Mutex
-	lazyInitializer LazyInitializer
-	idleTracker     *IdleTracker
+	cfg        *Config
+	dialer     *ProxyDialer
+	ctx        context.Context
+	cancel     context.CancelFunc
+	listener   net.Listener
+	listenerMu sync.Mutex
 }
 
 // NewSOCKS5Server creates a new unified SOCKS5 server
 func NewSOCKS5Server(cfg *Config, router routing.Router, agentMux *mux.AgentMux) *SOCKS5Server {
 	ctx, cancel := context.WithCancel(context.Background())
 	s := &SOCKS5Server{
-		cfg:      cfg,
-		router:   router,
-		agentMux: agentMux,
-		ctx:      ctx,
-		cancel:   cancel,
+		cfg:    cfg,
+		dialer: NewProxyDialer(router, agentMux),
+		ctx:    ctx,
+		cancel: cancel,
 	}
 	return s
 }
 
+// Dialer returns the underlying ProxyDialer for shared access
+func (s *SOCKS5Server) Dialer() *ProxyDialer {
+	return s.dialer
+}
+
 // SetLazyInitializer sets the lazy initializer for deferred AWS initialization
 func (s *SOCKS5Server) SetLazyInitializer(initializer LazyInitializer) {
-	s.lazyInitializer = initializer
+	s.dialer.SetLazyInitializer(initializer)
 }
 
 // SetIdleTracker sets the idle tracker for activity monitoring
 func (s *SOCKS5Server) SetIdleTracker(tracker *IdleTracker) {
-	s.idleTracker = tracker
+	s.dialer.SetIdleTracker(tracker)
 }
 
 // SetBackend updates the backend after lazy initialization
-func (s *SOCKS5Server) SetBackend(b backend.Backend) {
-	s.backendMu.Lock()
-	s.backend = b
-	s.backendMu.Unlock()
+func (s *SOCKS5Server) SetBackend(b Dialer) {
+	s.dialer.SetBackend(b)
 }
 
 // GetBackend returns the current backend (thread-safe)
-func (s *SOCKS5Server) GetBackend() backend.Backend {
-	s.backendMu.RLock()
-	defer s.backendMu.RUnlock()
-	return s.backend
+func (s *SOCKS5Server) GetBackend() Dialer {
+	return s.dialer.GetBackend()
 }
 
 // SetBackendDialer sets a simple dialer for testing
 func (s *SOCKS5Server) SetBackendDialer(d Dialer) {
-	s.backendMu.Lock()
-	s.dialer = d
-	s.backendMu.Unlock()
+	s.dialer.SetBackendDialer(d)
 }
 
 // GetDialer returns the current dialer (thread-safe)
 func (s *SOCKS5Server) GetDialer() Dialer {
-	s.backendMu.RLock()
-	defer s.backendMu.RUnlock()
-	if s.dialer != nil {
-		return s.dialer
-	}
-	return s.backend
+	return s.dialer.GetDialer()
 }
 
 // Start starts the unified SOCKS5 server
 func (s *SOCKS5Server) Start() error {
 	conf := &gosocks5.Config{
-		Dial:     s.dial,
+		Dial:     s.dialer.Dial,
 		Resolver: &noopResolver{},
 		Logger:   golog.New(&slogWriter{}, "", 0),
 	}
@@ -181,152 +166,7 @@ func (s *SOCKS5Server) Stop() {
 	s.listenerMu.Unlock()
 }
 
-// isInitialized checks if lazy initialization is complete
-func (s *SOCKS5Server) isInitialized() bool {
-	if s.lazyInitializer == nil {
-		return true
-	}
-	select {
-	case <-s.lazyInitializer.InitDone():
-		return true
-	default:
-		return false
-	}
-}
-
-// dial is the unified dial function for all route types
+// dial is exposed for backward compatibility with tests
 func (s *SOCKS5Server) dial(ctx context.Context, network, addr string) (net.Conn, error) {
-	host, port, err := net.SplitHostPort(addr)
-	if err != nil {
-		host = addr
-	}
-
-	// Determine route using the original hostname
-	route := routing.RouteProxy
-	if s.router != nil {
-		route = s.router.Route(host)
-	}
-
-	// Apply hosts mapping after routing decision (so routing matches on original hostname)
-	if s.router != nil {
-		resolved := s.router.ResolveHost(host)
-		if resolved != host {
-			proxyLogger.Info("Host resolved via hosts mapping", "original", host, "resolved", resolved)
-			host = resolved
-			if port != "" {
-				addr = net.JoinHostPort(host, port)
-			} else {
-				addr = host
-			}
-		}
-	}
-
-	// For direct route, connect directly (no need to wait for initialization)
-	if route == routing.RouteDirect {
-		var dialer net.Dialer
-		conn, err := dialer.DialContext(ctx, network, addr)
-		if err != nil {
-			proxyLogger.Warn("Dial failed", "route", route, "address", addr, "error", err)
-		}
-		return conn, err
-	}
-
-	// For vm-direct route, go through agent (no need to wait for proxy initialization)
-	if route == routing.RouteVMDirect {
-		conn, err := s.dialViaAgent(ctx, network, addr)
-		if err != nil {
-			proxyLogger.Warn("Dial failed", "route", route, "address", addr, "error", err)
-		}
-		return conn, err
-	}
-
-	// RouteProxy: check if lazy initialization is needed
-	if s.lazyInitializer != nil && !s.isInitialized() {
-		// Start initialization in background (non-blocking)
-		go s.lazyInitializer.EnsureInitialized(context.Background())
-
-		// Hold proxy connections until initialization completes
-		proxyLogger.Info("Waiting for initialization to complete", "address", addr)
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-s.lazyInitializer.InitDone():
-			if err := s.lazyInitializer.InitError(); err != nil {
-				return nil, fmt.Errorf("initialization failed: %w", err)
-			}
-			proxyLogger.Info("Initialization complete, dialing via proxy", "address", addr)
-		}
-	}
-
-	// Try primary route (proxy)
-	conn, err := s.dialProxy(ctx, network, addr)
-	if err == nil {
-		if s.idleTracker != nil {
-			s.idleTracker.Touch()
-		}
-		return conn, nil
-	}
-
-	// Check if fallback is needed
-	if !routing.IsFallbackableError(err) {
-		proxyLogger.Warn("Dial failed", "route", route, "address", addr, "error", err)
-		return nil, err
-	}
-
-	// Get fallback route
-	fallbackRoute := s.router.FallbackRoute(route)
-	if fallbackRoute == "" {
-		return nil, err
-	}
-
-	proxyLogger.Info("Fallback to alternative route",
-		"address", addr, "from", route, "to", fallbackRoute, "reason", err)
-
-	fallbackConn, fallbackErr := s.dialWithRoute(ctx, network, addr, fallbackRoute)
-	if fallbackErr != nil {
-		proxyLogger.Warn("Fallback dial failed", "route", fallbackRoute, "address", addr, "error", fallbackErr)
-	} else if fallbackRoute == routing.RouteProxy && s.idleTracker != nil {
-		s.idleTracker.Touch()
-	}
-	return fallbackConn, fallbackErr
-}
-
-// dialProxy dials using the proxy backend
-func (s *SOCKS5Server) dialProxy(ctx context.Context, network, addr string) (net.Conn, error) {
-	dialer := s.GetDialer()
-	if dialer != nil {
-		return dialer.Dial(ctx, network, addr)
-	}
-	// No backend configured, fall back to direct
-	var netDialer net.Dialer
-	return netDialer.DialContext(ctx, network, addr)
-}
-
-// dialWithRoute dials using the specified route
-func (s *SOCKS5Server) dialWithRoute(ctx context.Context, network, addr string, route routing.Route) (net.Conn, error) {
-	switch route {
-	case routing.RouteDirect:
-		var dialer net.Dialer
-		return dialer.DialContext(ctx, network, addr)
-	case routing.RouteVMDirect:
-		return s.dialViaAgent(ctx, network, addr)
-	default:
-		return s.dialProxy(ctx, network, addr)
-	}
-}
-
-// dialViaAgent dials via the VM agent using the shared AgentMux
-func (s *SOCKS5Server) dialViaAgent(ctx context.Context, network, addr string) (net.Conn, error) {
-	if s.agentMux == nil {
-		return nil, fmt.Errorf("no agent connection available for vm-direct route")
-	}
-
-	dialCtx := ctx
-	if _, ok := ctx.Deadline(); !ok {
-		var cancel context.CancelFunc
-		dialCtx, cancel = context.WithTimeout(ctx, 30*time.Second)
-		defer cancel()
-	}
-
-	return s.agentMux.Dial(dialCtx, network, addr)
+	return s.dialer.Dial(ctx, network, addr)
 }

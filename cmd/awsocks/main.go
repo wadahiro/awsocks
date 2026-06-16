@@ -113,6 +113,10 @@ func main() {
 						Aliases: []string{"l"},
 						Usage:   "SOCKS5 listen address",
 					},
+					&cli.StringFlag{
+						Name:  "http-listen",
+						Usage: "HTTP CONNECT proxy listen address (e.g., 127.0.0.1:8080)",
+					},
 					&cli.IntFlag{
 						Name:    "remote-port",
 						Aliases: []string{"p"},
@@ -235,7 +239,8 @@ func startAction(c *cli.Context) error {
 		Profile:          merged.AWSProfile,
 		Region:           merged.Region,
 		ListenAddr:       merged.Listen,
-		ProxyNetwork:      merged.ProxyNetwork,
+		HTTPListenAddr:   merged.HTTPListen,
+		ProxyNetwork:     merged.ProxyNetwork,
 		Backend:          c.String("backend"),
 		RemotePort:       merged.RemotePort,
 		SSHUser:          merged.SSHUser,
@@ -266,6 +271,9 @@ func startAction(c *cli.Context) error {
 	}
 	fmt.Printf("Backend: %s\n", cfg.Backend)
 	fmt.Printf("Listen: %s\n", cfg.ListenAddr)
+	if cfg.HTTPListenAddr != "" {
+		fmt.Printf("HTTP Listen: %s\n", cfg.HTTPListenAddr)
+	}
 	if profileName != "" {
 		fmt.Printf("Config Profile: %s\n", profileName)
 	}
@@ -367,6 +375,9 @@ func buildCLIFlags(c *cli.Context) *appconfig.CLIFlags {
 	}
 	if c.IsSet("listen") {
 		cli.Listen = c.String("listen")
+	}
+	if c.IsSet("http-listen") {
+		cli.HTTPListen = c.String("http-listen")
 	}
 	if c.IsSet("remote-port") {
 		cli.RemotePort = c.Int("remote-port")

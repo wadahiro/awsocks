@@ -39,9 +39,10 @@ type Profile struct {
 
 	// Proxy settings
 	ProxyNetwork string `toml:"proxy-network"` // "direct" (default) or "vm"
-	Listen      string `toml:"listen"`
-	RemotePort  int    `toml:"remote-port"`
-	Lazy        *bool  `toml:"lazy"`
+	Listen       string `toml:"listen"`
+	HTTPListen   string `toml:"http-listen"` // HTTP CONNECT proxy listen address
+	RemotePort   int    `toml:"remote-port"`
+	Lazy         *bool  `toml:"lazy"`
 
 	// SSH keepalive
 	SSHKeepalive string `toml:"ssh-keepalive"` // e.g., "30s", "0" to disable
@@ -54,6 +55,7 @@ type Profile struct {
 type Defaults struct {
 	SSHUser      string `toml:"ssh-user"`
 	Listen       string `toml:"listen"`
+	HTTPListen   string `toml:"http-listen"` // HTTP CONNECT proxy listen address
 	ProxyNetwork string `toml:"proxy-network"` // "direct" (default) or "vm"
 	RemotePort   int    `toml:"remote-port"`
 	Lazy         *bool  `toml:"lazy"`

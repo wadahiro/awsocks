@@ -53,6 +53,9 @@ type Config struct {
 
 	// Proxy network: "direct" (default) or "vm"
 	ProxyNetwork string
+
+	// HTTP CONNECT proxy listen address (empty = disabled)
+	HTTPListenAddr string
 }
 
 // Dialer is an interface for dialing connections (subset of backend.Backend)
@@ -71,6 +74,7 @@ type Manager struct {
 	backend            backend.Backend     // only when needsProxy
 	credProv           *credentials.Provider
 	socks5             *SOCKS5Server
+	httpProxy          *HTTPProxyServer
 	router             routing.Router
 	idleTracker        *IdleTracker
 	clock              clock.Clock
@@ -151,21 +155,46 @@ func (m *Manager) Start(ctx context.Context) error {
 
 	// 5. Create and start SOCKS5 server
 	m.socks5 = NewSOCKS5Server(m.cfg, m.router, m.agentMux)
+	m.configureProxyDialer(m.socks5.Dialer(), needsProxy)
 
-	if m.backend != nil {
-		m.socks5.SetBackend(m.backend)
+	// 6. Optionally create HTTP CONNECT proxy (shares same routing/dial logic)
+	if m.cfg.HTTPListenAddr != "" {
+		m.httpProxy = NewHTTPProxyServer(m.cfg, m.router, m.agentMux)
+		m.configureProxyDialer(m.httpProxy.Dialer(), needsProxy)
 	}
 
-	if needsProxy && (m.cfg.LazyConnect || m.cfg.IdleTimeout > 0) {
-		m.socks5.SetLazyInitializer(m)
-	}
+	// Start servers
+	if m.httpProxy != nil {
+		logger.Info("Starting HTTP CONNECT proxy", "listen", m.cfg.HTTPListenAddr)
+		errCh := make(chan error, 2)
 
-	if m.idleTracker != nil {
-		m.socks5.SetIdleTracker(m.idleTracker)
+		go func() {
+			errCh <- m.httpProxy.Start()
+		}()
+
+		go func() {
+			errCh <- m.socks5.Start()
+		}()
+
+		logger.Info("Starting SOCKS5 proxy", "listen", m.cfg.ListenAddr)
+		return <-errCh
 	}
 
 	logger.Info("Starting SOCKS5 proxy", "listen", m.cfg.ListenAddr)
 	return m.socks5.Start()
+}
+
+// configureProxyDialer applies backend, lazy initializer, and idle tracker to a ProxyDialer
+func (m *Manager) configureProxyDialer(d *ProxyDialer, needsProxy bool) {
+	if m.backend != nil {
+		d.SetBackend(m.backend)
+	}
+	if needsProxy && (m.cfg.LazyConnect || m.cfg.IdleTimeout > 0) {
+		d.SetLazyInitializer(m)
+	}
+	if m.idleTracker != nil {
+		d.SetIdleTracker(m.idleTracker)
+	}
 }
 
 // needsVM determines if a VM should be started
@@ -388,9 +417,14 @@ func (m *Manager) EnsureInitialized(ctx context.Context) error {
 		return err
 	}
 
-	// Update socks5 server's backend reference
-	if m.socks5 != nil && m.backend != nil {
-		m.socks5.SetBackend(m.backend)
+	// Update proxy servers' backend references
+	if m.backend != nil {
+		if m.socks5 != nil {
+			m.socks5.Dialer().SetBackend(m.backend)
+		}
+		if m.httpProxy != nil {
+			m.httpProxy.Dialer().SetBackend(m.backend)
+		}
 	}
 
 	m.awsInitialized = true
@@ -511,6 +545,10 @@ func (m *Manager) Stop() error {
 
 	if m.socks5 != nil {
 		m.socks5.Stop()
+	}
+
+	if m.httpProxy != nil {
+		m.httpProxy.Stop()
 	}
 
 	if m.agentMux != nil {

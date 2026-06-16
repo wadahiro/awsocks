@@ -26,10 +26,11 @@ type CLIFlags struct {
 
 	// Proxy settings
 	ProxyNetwork string // "direct" or "vm"
-	Listen      string
-	RemotePort  int
-	Lazy        *bool
-	LazyIsSet   bool
+	Listen       string
+	HTTPListen   string // HTTP CONNECT proxy listen address
+	RemotePort   int
+	Lazy         *bool
+	LazyIsSet    bool
 
 	// Routing settings
 	RouteDefault  string
@@ -56,6 +57,7 @@ type MergedConfig struct {
 	IdleTimeout          time.Duration
 	ProxyNetwork         string // "direct" (default) or "vm"
 	Listen               string
+	HTTPListen           string // HTTP CONNECT proxy listen address
 	RemotePort           int
 	Lazy                 bool
 	SSHKeepaliveInterval time.Duration
@@ -94,6 +96,9 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		}
 		if defaults.Listen != "" {
 			result.Listen = defaults.Listen
+		}
+		if defaults.HTTPListen != "" {
+			result.HTTPListen = defaults.HTTPListen
 		}
 		if defaults.ProxyNetwork != "" {
 			result.ProxyNetwork = defaults.ProxyNetwork
@@ -154,6 +159,9 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		if profile.Listen != "" {
 			result.Listen = profile.Listen
 		}
+		if profile.HTTPListen != "" {
+			result.HTTPListen = profile.HTTPListen
+		}
 		if profile.RemotePort != 0 {
 			result.RemotePort = profile.RemotePort
 		}
@@ -212,6 +220,9 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 		}
 		if cli.Listen != "" {
 			result.Listen = cli.Listen
+		}
+		if cli.HTTPListen != "" {
+			result.HTTPListen = cli.HTTPListen
 		}
 		if cli.RemotePort != 0 {
 			result.RemotePort = cli.RemotePort
