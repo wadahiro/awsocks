@@ -12,6 +12,7 @@ import (
 	"github.com/wadahiro/awsocks/internal/backend/ssm/datachannel"
 	ec2pkg "github.com/wadahiro/awsocks/internal/ec2"
 	"github.com/wadahiro/awsocks/internal/log"
+	"github.com/wadahiro/awsocks/internal/routing"
 	"golang.org/x/crypto/ssh"
 )
 
@@ -69,6 +70,10 @@ type Config struct {
 	AutoStartEC2 bool          // Enable EC2 auto-start on first Dial
 	EC2Client    ec2pkg.Client // EC2 client for instance management (optional)
 
+	// Upstream proxy for SSH tunnel
+	UpstreamProxyURL      string   // e.g., "http://localhost:8080"
+	UpstreamProxyPatterns []string // e.g., ["*.internal.example.com"]
+
 	// Custom DialContext for WebSocket connections (nil = default)
 	DialContextFn datachannel.DialContextFunc
 
@@ -99,6 +104,9 @@ type Backend struct {
 	// Credentials (lock-free read via atomic.Value)
 	credentials atomic.Value // stores aws.Credentials
 
+	// Upstream proxy pattern matchers (compiled from config)
+	upstreamProxyMatchers []routing.Matcher
+
 	// Connection tracking
 	openChannels int64
 
@@ -114,7 +122,39 @@ func New(cfg *Config, ssmClient SSMClient) *Backend {
 		stateNotify: make(chan struct{}),
 	}
 	b.state.Store(int32(StateIdle))
+
+	// Compile upstream proxy patterns
+	for _, p := range cfg.UpstreamProxyPatterns {
+		b.upstreamProxyMatchers = append(b.upstreamProxyMatchers, routing.ParseMatcher(p))
+	}
+
 	return b
+}
+
+// shouldUseUpstreamProxy checks if the address should be routed through the upstream proxy.
+// Returns true if upstream proxy is configured and the host matches any of the patterns.
+// If no patterns are configured, all connections go through the upstream proxy.
+func (b *Backend) shouldUseUpstreamProxy(address string) bool {
+	if b.config.UpstreamProxyURL == "" {
+		return false
+	}
+
+	// No patterns means all connections go through proxy
+	if len(b.upstreamProxyMatchers) == 0 {
+		return true
+	}
+
+	host, _, err := net.SplitHostPort(address)
+	if err != nil {
+		host = address
+	}
+
+	for _, m := range b.upstreamProxyMatchers {
+		if m.Match(host) {
+			return true
+		}
+	}
+	return false
 }
 
 // log helper methods that use callback if available, otherwise use standard logger
@@ -231,7 +271,13 @@ func (b *Backend) Dial(ctx context.Context, network, address string) (net.Conn, 
 	resultCh := make(chan dialResult, 1)
 
 	go func() {
-		conn, err := client.Dial(network, address)
+		var conn net.Conn
+		var err error
+		if b.shouldUseUpstreamProxy(address) {
+			conn, err = dialViaUpstreamProxy(client, b.config.UpstreamProxyURL, network, address)
+		} else {
+			conn, err = client.Dial(network, address)
+		}
 		resultCh <- dialResult{conn, err}
 	}()
 

@@ -41,6 +41,10 @@ type CLIFlags struct {
 	// SSH keepalive
 	SSHKeepalive      string
 	SSHKeepaliveIsSet bool
+
+	// Upstream proxy
+	UpstreamProxyURL      string
+	UpstreamProxyPatterns []string
 }
 
 // MergedConfig represents the final merged configuration.
@@ -61,6 +65,7 @@ type MergedConfig struct {
 	RemotePort           int
 	Lazy                 bool
 	SSHKeepaliveInterval time.Duration
+	UpstreamProxy        *UpstreamProxyConfig
 	Routing              *RoutingConfig
 }
 
@@ -121,6 +126,9 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 			if d, err := time.ParseDuration(defaults.SSHKeepalive); err == nil {
 				result.SSHKeepaliveInterval = d
 			}
+		}
+		if defaults.UpstreamProxy != nil {
+			result.UpstreamProxy = defaults.UpstreamProxy
 		}
 	}
 
@@ -184,6 +192,9 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 				result.SSHKeepaliveInterval = d
 			}
 		}
+		if profile.UpstreamProxy != nil {
+			result.UpstreamProxy = profile.UpstreamProxy
+		}
 	}
 
 	// Apply CLI settings (highest priority)
@@ -235,6 +246,18 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 			if d, err := time.ParseDuration(cli.SSHKeepalive); err == nil {
 				result.SSHKeepaliveInterval = d
 			}
+		}
+		if cli.UpstreamProxyURL != "" {
+			if result.UpstreamProxy == nil {
+				result.UpstreamProxy = &UpstreamProxyConfig{}
+			}
+			result.UpstreamProxy.URL = cli.UpstreamProxyURL
+		}
+		if len(cli.UpstreamProxyPatterns) > 0 {
+			if result.UpstreamProxy == nil {
+				result.UpstreamProxy = &UpstreamProxyConfig{}
+			}
+			result.UpstreamProxy.Patterns = cli.UpstreamProxyPatterns
 		}
 
 		// Apply CLI routing settings

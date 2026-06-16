@@ -20,6 +20,12 @@ import (
 	"github.com/wadahiro/awsocks/internal/vm"
 )
 
+// UpstreamProxyConfig holds upstream proxy configuration
+type UpstreamProxyConfig struct {
+	URL      string   // e.g., "http://localhost:8080"
+	Patterns []string // e.g., ["*.internal.example.com"]
+}
+
 // Config holds proxy configuration
 type Config struct {
 	InstanceID string
@@ -56,6 +62,9 @@ type Config struct {
 
 	// HTTP CONNECT proxy listen address (empty = disabled)
 	HTTPListenAddr string
+
+	// Upstream proxy configuration
+	UpstreamProxy *UpstreamProxyConfig
 }
 
 // Dialer is an interface for dialing connections (subset of backend.Backend)
@@ -195,6 +204,20 @@ func (m *Manager) configureProxyDialer(d *ProxyDialer, needsProxy bool) {
 	if m.idleTracker != nil {
 		d.SetIdleTracker(m.idleTracker)
 	}
+}
+
+func upstreamProxyURL(cfg *UpstreamProxyConfig) string {
+	if cfg == nil {
+		return ""
+	}
+	return cfg.URL
+}
+
+func upstreamProxyPatterns(cfg *UpstreamProxyConfig) []string {
+	if cfg == nil {
+		return nil
+	}
+	return cfg.Patterns
 }
 
 // needsVM determines if a VM should be started
@@ -358,6 +381,8 @@ func (m *Manager) initializeProxy(ctx context.Context) error {
 			SSHKeyPath:           m.cfg.SSHKeyPath,
 			AutoStartEC2:         m.cfg.AutoStart,
 			SSHKeepaliveInterval: m.cfg.SSHKeepaliveInterval,
+			UpstreamProxyURL:      upstreamProxyURL(m.cfg.UpstreamProxy),
+			UpstreamProxyPatterns: upstreamProxyPatterns(m.cfg.UpstreamProxy),
 		}
 
 		ssmBe := m.awsClient.NewSSMBackend(backendCfg)

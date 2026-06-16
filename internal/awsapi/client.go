@@ -149,6 +149,8 @@ type SSMBackendConfig struct {
 	SSHKeyPath           string
 	AutoStartEC2         bool
 	SSHKeepaliveInterval time.Duration
+	UpstreamProxyURL      string   // e.g., "http://localhost:8080"
+	UpstreamProxyPatterns []string // e.g., ["*.internal.example.com"]
 }
 
 // NewSSMBackend creates a new SSM backend with the client's dial function injected.
@@ -159,6 +161,8 @@ func (c *Client) NewSSMBackend(cfg *SSMBackendConfig) *ssmbackend.Backend {
 		SSHUser:              cfg.SSHUser,
 		SSHKeyPath:           cfg.SSHKeyPath,
 		SSHKeepaliveInterval: cfg.SSHKeepaliveInterval,
+		UpstreamProxyURL:      cfg.UpstreamProxyURL,
+		UpstreamProxyPatterns: cfg.UpstreamProxyPatterns,
 	}
 
 	if cfg.AutoStartEC2 {

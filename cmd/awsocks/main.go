@@ -156,6 +156,14 @@ func main() {
 						Name:  "ssh-keepalive",
 						Usage: "SSH keepalive interval (e.g., \"30s\", \"0\" to disable)",
 					},
+					&cli.StringFlag{
+						Name:  "upstream-proxy",
+						Usage: "Upstream proxy URL for SSH tunnel (e.g., \"http://localhost:8080\")",
+					},
+					&cli.StringSliceFlag{
+						Name:  "upstream-proxy-pattern",
+						Usage: "Patterns to route via upstream proxy (can be specified multiple times)",
+					},
 					},
 				Action: startAction,
 			},
@@ -252,6 +260,7 @@ func startAction(c *cli.Context) error {
 		LazyConnect:          merged.Lazy,
 		IdleTimeout:          merged.IdleTimeout,
 		SSHKeepaliveInterval: merged.SSHKeepaliveInterval,
+		UpstreamProxy:        convertUpstreamProxy(merged.UpstreamProxy),
 	}
 
 	// Validate VM requirements
@@ -292,6 +301,12 @@ func startAction(c *cli.Context) error {
 	if cfg.Backend == "ssm" && cfg.SSHKeyPath != "" {
 		fmt.Printf("SSH User: %s\n", cfg.SSHUser)
 		fmt.Printf("SSH Key: %s\n", cfg.SSHKeyPath)
+	}
+	if cfg.UpstreamProxy != nil {
+		fmt.Printf("Upstream Proxy: %s\n", cfg.UpstreamProxy.URL)
+		if len(cfg.UpstreamProxy.Patterns) > 0 {
+			fmt.Printf("Upstream Proxy Patterns: %s\n", strings.Join(cfg.UpstreamProxy.Patterns, ", "))
+		}
 	}
 	if routingCfg != nil && routingCfg.Default != "" {
 		fmt.Printf("Route default: %s\n", routingCfg.Default)
@@ -405,6 +420,12 @@ func buildCLIFlags(c *cli.Context) *appconfig.CLIFlags {
 		cli.SSHKeepalive = c.String("ssh-keepalive")
 		cli.SSHKeepaliveIsSet = true
 	}
+	if c.IsSet("upstream-proxy") {
+		cli.UpstreamProxyURL = c.String("upstream-proxy")
+	}
+	if c.IsSet("upstream-proxy-pattern") {
+		cli.UpstreamProxyPatterns = c.StringSlice("upstream-proxy-pattern")
+	}
 
 	return cli
 }
@@ -420,6 +441,16 @@ func buildRoutingConfig(cfg *appconfig.RoutingConfig) *routing.Config {
 		Direct:   cfg.Direct,
 		VMDirect: cfg.VMDirect,
 		Hosts:    cfg.Hosts,
+	}
+}
+
+func convertUpstreamProxy(cfg *appconfig.UpstreamProxyConfig) *proxy.UpstreamProxyConfig {
+	if cfg == nil {
+		return nil
+	}
+	return &proxy.UpstreamProxyConfig{
+		URL:      cfg.URL,
+		Patterns: cfg.Patterns,
 	}
 }
 

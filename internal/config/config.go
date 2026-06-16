@@ -47,6 +47,9 @@ type Profile struct {
 	// SSH keepalive
 	SSHKeepalive string `toml:"ssh-keepalive"` // e.g., "30s", "0" to disable
 
+	// Upstream proxy configuration
+	UpstreamProxy *UpstreamProxyConfig `toml:"upstream-proxy"`
+
 	// Routing configuration
 	Routing *RoutingConfig `toml:"routing"`
 }
@@ -62,8 +65,18 @@ type Defaults struct {
 	IdleTimeout  string `toml:"idle-timeout"`  // e.g., "30m", "1h"
 	SSHKeepalive string `toml:"ssh-keepalive"` // e.g., "30s", "0" to disable
 
+	// Upstream proxy configuration
+	UpstreamProxy *UpstreamProxyConfig `toml:"upstream-proxy"`
+
 	// Default routing configuration
 	Routing *RoutingConfig `toml:"routing"`
+}
+
+// UpstreamProxyConfig defines an upstream proxy for SSH tunnel connections.
+// Only connections matching the specified patterns are routed through the proxy.
+type UpstreamProxyConfig struct {
+	URL      string   `toml:"url"`      // e.g., "http://localhost:8080", "socks5://proxy:1080"
+	Patterns []string `toml:"patterns"` // e.g., ["*.internal.example.com", "*.partner.example.com"]
 }
 
 // RoutingConfig defines how traffic is routed based on destination patterns.
