@@ -74,7 +74,38 @@ func TestHTTPProxyServer_CONNECT(t *testing.T) {
 	server.Stop()
 }
 
-func TestHTTPProxyServer_CONNECT_NonCONNECT_Returns405(t *testing.T) {
+func TestHTTPProxyServer_ForwardGET(t *testing.T) {
+	// Start a target HTTP server
+	targetListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer targetListener.Close()
+
+	go func() {
+		for {
+			conn, err := targetListener.Accept()
+			if err != nil {
+				return
+			}
+			go func() {
+				defer conn.Close()
+				br := bufio.NewReader(conn)
+				req, err := http.ReadRequest(br)
+				if err != nil {
+					return
+				}
+				// Verify the request is relative (not absolute URL)
+				assert.Equal(t, "/api/data", req.URL.Path)
+				assert.Equal(t, "", req.URL.Host)
+				// Verify hop-by-hop headers are removed
+				assert.Empty(t, req.Header.Get("Proxy-Connection"))
+
+				body := `{"ok": true}`
+				fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: close\r\n\r\n%s", len(body), body)
+			}()
+		}
+	}()
+	targetAddr := targetListener.Addr().String()
+
 	router := &mockRouter{route: routing.RouteDirect}
 	cfg := &Config{
 		HTTPListenAddr: "127.0.0.1:0",
@@ -90,17 +121,21 @@ func TestHTTPProxyServer_CONNECT_NonCONNECT_Returns405(t *testing.T) {
 	require.NotNil(t, listener)
 	proxyAddr := listener.Addr().String()
 
-	// Send GET request (not CONNECT)
+	// Send GET with absolute URL (as HTTP proxy clients do)
 	conn, err := net.DialTimeout("tcp", proxyAddr, time.Second)
 	require.NoError(t, err)
 	defer conn.Close()
 
-	fmt.Fprintf(conn, "GET http://example.com/ HTTP/1.1\r\nHost: example.com\r\n\r\n")
+	fmt.Fprintf(conn, "GET http://%s/api/data HTTP/1.1\r\nHost: %s\r\nProxy-Connection: Keep-Alive\r\n\r\n", targetAddr, targetAddr)
 
 	br := bufio.NewReader(conn)
 	resp, err := http.ReadResponse(br, nil)
 	require.NoError(t, err)
-	assert.Equal(t, http.StatusMethodNotAllowed, resp.StatusCode)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, `{"ok": true}`, string(body))
 
 	server.Stop()
 }
