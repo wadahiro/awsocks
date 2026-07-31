@@ -270,22 +270,26 @@ func Merge(defaults *Defaults, profile *Profile, cli *CLIFlags) *MergedConfig {
 // mergeRoutingFromDefaults creates a new routing config from defaults.
 func mergeRoutingFromDefaults(src *RoutingConfig) *RoutingConfig {
 	return &RoutingConfig{
-		Default:  src.Default,
-		Proxy:    copySlice(src.Proxy),
-		Direct:   copySlice(src.Direct),
-		VMDirect: copySlice(src.VMDirect),
-		Hosts:    copyMap(src.Hosts),
+		Default:            src.Default,
+		Proxy:              copySlice(src.Proxy),
+		Direct:             copySlice(src.Direct),
+		VMDirect:           copySlice(src.VMDirect),
+		Hosts:              copyMap(src.Hosts),
+		PreConnectDirect:   copySlice(src.PreConnectDirect),
+		PreConnectVMDirect: copySlice(src.PreConnectVMDirect),
 	}
 }
 
 // mergeRoutingFromProfile merges profile routing into existing routing config.
 func mergeRoutingFromProfile(base *RoutingConfig, profile *RoutingConfig) *RoutingConfig {
 	result := &RoutingConfig{
-		Default:  base.Default,
-		Proxy:    copySlice(base.Proxy),
-		Direct:   copySlice(base.Direct),
-		VMDirect: copySlice(base.VMDirect),
-		Hosts:    copyMap(base.Hosts),
+		Default:            base.Default,
+		Proxy:              copySlice(base.Proxy),
+		Direct:             copySlice(base.Direct),
+		VMDirect:           copySlice(base.VMDirect),
+		Hosts:              copyMap(base.Hosts),
+		PreConnectDirect:   copySlice(base.PreConnectDirect),
+		PreConnectVMDirect: copySlice(base.PreConnectVMDirect),
 	}
 
 	if profile.Default != "" {
@@ -296,6 +300,8 @@ func mergeRoutingFromProfile(base *RoutingConfig, profile *RoutingConfig) *Routi
 	result.Proxy = mergeStringSlices(result.Proxy, profile.Proxy)
 	result.Direct = mergeStringSlices(result.Direct, profile.Direct)
 	result.VMDirect = mergeStringSlices(result.VMDirect, profile.VMDirect)
+	result.PreConnectDirect = mergeStringSlices(result.PreConnectDirect, profile.PreConnectDirect)
+	result.PreConnectVMDirect = mergeStringSlices(result.PreConnectVMDirect, profile.PreConnectVMDirect)
 
 	// Merge hosts (profile overrides base)
 	result.Hosts = mergeMaps(result.Hosts, profile.Hosts)
@@ -306,11 +312,13 @@ func mergeRoutingFromProfile(base *RoutingConfig, profile *RoutingConfig) *Routi
 // mergeRoutingFromCLI merges CLI routing settings into existing routing config.
 func mergeRoutingFromCLI(base *RoutingConfig, cli *CLIFlags) *RoutingConfig {
 	result := &RoutingConfig{
-		Default:  base.Default,
-		Proxy:    copySlice(base.Proxy),
-		Direct:   copySlice(base.Direct),
-		VMDirect: copySlice(base.VMDirect),
-		Hosts:    copyMap(base.Hosts),
+		Default:            base.Default,
+		Proxy:              copySlice(base.Proxy),
+		Direct:             copySlice(base.Direct),
+		VMDirect:           copySlice(base.VMDirect),
+		Hosts:              copyMap(base.Hosts),
+		PreConnectDirect:   copySlice(base.PreConnectDirect),
+		PreConnectVMDirect: copySlice(base.PreConnectVMDirect),
 	}
 
 	if cli.RouteDefault != "" {

@@ -18,16 +18,23 @@ type Router interface {
 	// ResolveHost returns the mapped address for the given host.
 	// If no mapping exists, returns the original host unchanged.
 	ResolveHost(host string) string
+	// RoutePreConnect returns the route to use for the given host while the
+	// proxy backend has not finished connecting yet. Returns empty string if
+	// the host has no pre-connect override, meaning callers should wait for
+	// the backend instead of routing around it.
+	RoutePreConnect(host string) Route
 }
 
 // DefaultRouter implements Router with pattern-based routing rules
 type DefaultRouter struct {
-	defaultRoute     Route
-	proxyMatchers    []Matcher
-	directMatchers   []Matcher
-	vmDirectMatchers []Matcher
-	vmModeEnabled    bool
-	hosts            map[string]string // lowercase hostname -> address
+	defaultRoute               Route
+	proxyMatchers              []Matcher
+	directMatchers             []Matcher
+	vmDirectMatchers           []Matcher
+	preConnectDirectMatchers   []Matcher
+	preConnectVMDirectMatchers []Matcher
+	vmModeEnabled              bool
+	hosts                      map[string]string // lowercase hostname -> address
 }
 
 // RouterOption configures the router
@@ -64,6 +71,16 @@ func NewRouter(cfg *Config, opts ...RouterOption) *DefaultRouter {
 	if r.vmModeEnabled {
 		for _, pattern := range cfg.VMDirect {
 			r.vmDirectMatchers = append(r.vmDirectMatchers, ParseMatcher(pattern))
+		}
+	}
+
+	// Parse pre-connect override patterns
+	for _, pattern := range cfg.PreConnectDirect {
+		r.preConnectDirectMatchers = append(r.preConnectDirectMatchers, ParseMatcher(pattern))
+	}
+	if r.vmModeEnabled {
+		for _, pattern := range cfg.PreConnectVMDirect {
+			r.preConnectVMDirectMatchers = append(r.preConnectVMDirectMatchers, ParseMatcher(pattern))
 		}
 	}
 
@@ -143,6 +160,27 @@ func (r *DefaultRouter) ResolveHost(host string) string {
 // HasVMDirectRoutes returns true if any vm-direct routes are configured
 func (r *DefaultRouter) HasVMDirectRoutes() bool {
 	return len(r.vmDirectMatchers) > 0
+}
+
+// RoutePreConnect returns the route to use for the given host while the
+// proxy backend has not finished connecting yet. Returns empty string if
+// the host has no pre-connect override.
+func (r *DefaultRouter) RoutePreConnect(host string) Route {
+	if r.vmModeEnabled {
+		for _, m := range r.preConnectVMDirectMatchers {
+			if m.Match(host) {
+				logger.Debug("Pre-connect route matched", "host", host, "route", RouteVMDirect)
+				return RouteVMDirect
+			}
+		}
+	}
+	for _, m := range r.preConnectDirectMatchers {
+		if m.Match(host) {
+			logger.Debug("Pre-connect route matched", "host", host, "route", RouteDirect)
+			return RouteDirect
+		}
+	}
+	return ""
 }
 
 // FallbackRoute returns the fallback route for the given route.

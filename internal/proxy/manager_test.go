@@ -261,6 +261,58 @@ func TestDial_RouteProxy_WaitsForInit(t *testing.T) {
 	}
 }
 
+func TestDial_RouteProxy_PreConnectOverrideSkipsWait(t *testing.T) {
+	dummyListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer dummyListener.Close()
+	dummyAddr := dummyListener.Addr().String()
+	go func() {
+		for {
+			conn, err := dummyListener.Accept()
+			if err != nil {
+				return
+			}
+			conn.Close()
+		}
+	}()
+
+	router := &mockRouter{route: routing.RouteProxy, preConnectRoute: routing.RouteDirect}
+	server := NewSOCKS5Server(newTestConfig(), router, nil)
+
+	mock := newMockLazyInitForDirect()
+	server.SetLazyInitializer(mock)
+	// Backend would block forever if used, proving the pre-connect override bypassed it.
+	server.SetBackendDialer(&mockBackendForTest{
+		dialFunc: func(ctx context.Context, network, addr string) (net.Conn, error) {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		},
+	})
+
+	type dialResult struct {
+		conn net.Conn
+		err  error
+	}
+	resultCh := make(chan dialResult, 1)
+	go func() {
+		conn, err := server.dial(context.Background(), "tcp", dummyAddr)
+		resultCh <- dialResult{conn: conn, err: err}
+	}()
+
+	select {
+	case result := <-resultCh:
+		require.NoError(t, result.err)
+		assert.NotNil(t, result.conn)
+		if result.conn != nil {
+			result.conn.Close()
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("Dial should return immediately via pre-connect override without waiting for init")
+	}
+
+	assert.Equal(t, int32(1), atomic.LoadInt32(&mock.ensureCalls))
+}
+
 func TestDial_RouteProxy_InitFailure(t *testing.T) {
 	router := &mockRouter{route: routing.RouteProxy}
 	server := NewSOCKS5Server(newTestConfig(), router, nil)

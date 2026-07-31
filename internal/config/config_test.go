@@ -260,6 +260,8 @@ vm-direct = ["*.local"]
 default = "proxy"
 proxy = ["*.company.com"]
 direct = ["127.0.0.1"]
+pre-connect-direct = ["sso.example.com"]
+pre-connect-vm-direct = ["sso-vm.example.com"]
 `
 	tmpDir := t.TempDir()
 	configPath := filepath.Join(tmpDir, "config.toml")
@@ -281,4 +283,6 @@ direct = ["127.0.0.1"]
 	assert.Equal(t, "proxy", work.Routing.Default)
 	assert.Equal(t, []string{"*.company.com"}, work.Routing.Proxy)
 	assert.Equal(t, []string{"127.0.0.1"}, work.Routing.Direct)
+	assert.Equal(t, []string{"sso.example.com"}, work.Routing.PreConnectDirect)
+	assert.Equal(t, []string{"sso-vm.example.com"}, work.Routing.PreConnectVMDirect)
 }

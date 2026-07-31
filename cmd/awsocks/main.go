@@ -436,11 +436,13 @@ func buildRoutingConfig(cfg *appconfig.RoutingConfig) *routing.Config {
 	}
 
 	return &routing.Config{
-		Default:  cfg.Default,
-		Proxy:    cfg.Proxy,
-		Direct:   cfg.Direct,
-		VMDirect: cfg.VMDirect,
-		Hosts:    cfg.Hosts,
+		Default:            cfg.Default,
+		Proxy:              cfg.Proxy,
+		Direct:             cfg.Direct,
+		VMDirect:           cfg.VMDirect,
+		Hosts:              cfg.Hosts,
+		PreConnectDirect:   cfg.PreConnectDirect,
+		PreConnectVMDirect: cfg.PreConnectVMDirect,
 	}
 }
 

@@ -144,8 +144,9 @@ func mockAgent(t *testing.T, conn net.Conn) {
 
 // mockRouter implements routing.Router for testing
 type mockRouter struct {
-	route         routing.Route
-	fallbackRoute routing.Route
+	route           routing.Route
+	fallbackRoute   routing.Route
+	preConnectRoute routing.Route
 }
 
 func (r *mockRouter) Route(host string) routing.Route {
@@ -158,6 +159,10 @@ func (r *mockRouter) FallbackRoute(current routing.Route) routing.Route {
 
 func (r *mockRouter) ResolveHost(host string) string {
 	return host
+}
+
+func (r *mockRouter) RoutePreConnect(host string) routing.Route {
+	return r.preConnectRoute
 }
 
 func TestSOCKS5Server_dial_RouteProxy_WaitsForInit(t *testing.T) {

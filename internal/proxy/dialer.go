@@ -136,6 +136,16 @@ func (d *ProxyDialer) Dial(ctx context.Context, network, addr string) (net.Conn,
 
 	// RouteProxy: check if lazy initialization is needed
 	if d.lazyInitializer != nil && !d.isInitialized() {
+		// Hosts with a pre-connect override skip the wait entirely and use
+		// the override route until the backend finishes connecting.
+		if d.router != nil {
+			if preRoute := d.router.RoutePreConnect(host); preRoute != "" {
+				go d.lazyInitializer.EnsureInitialized(context.Background())
+				dialerLogger.Info("Backend not ready, using pre-connect route", "address", addr, "route", preRoute)
+				return d.dialWithRoute(ctx, network, addr, preRoute)
+			}
+		}
+
 		// Start initialization in background (non-blocking)
 		go d.lazyInitializer.EnsureInitialized(context.Background())
 

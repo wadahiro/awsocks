@@ -333,3 +333,70 @@ func TestDefaultRouter_ResolveHost(t *testing.T) {
 	// DefaultRouter should return host as-is (no hosts mapping)
 	assert.Equal(t, "api.internal", router.ResolveHost("api.internal"))
 }
+
+func TestRouter_RoutePreConnect(t *testing.T) {
+	cfg := &Config{
+		Default: "proxy",
+		Proxy: []string{
+			"*.internal.company.com",
+		},
+		PreConnectDirect: []string{
+			"sso.example.com",
+		},
+	}
+
+	router := NewRouter(cfg)
+
+	tests := []struct {
+		name string
+		host string
+		want Route
+	}{
+		{"pre-connect override host", "sso.example.com", RouteDirect},
+		{"other proxy host has no override", "api.internal.company.com", Route("")},
+		{"unrelated host has no override", "www.google.com", Route("")},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			assert.Equal(t, tt.want, router.RoutePreConnect(tt.host))
+		})
+	}
+}
+
+func TestRouter_RoutePreConnect_VMMode(t *testing.T) {
+	cfg := &Config{
+		Default: "proxy",
+		PreConnectDirect: []string{
+			"sso.example.com",
+		},
+		PreConnectVMDirect: []string{
+			"sso-vm.example.com",
+		},
+	}
+
+	router := NewRouter(cfg, WithVMMode())
+
+	assert.Equal(t, RouteDirect, router.RoutePreConnect("sso.example.com"))
+	assert.Equal(t, RouteVMDirect, router.RoutePreConnect("sso-vm.example.com"))
+	assert.Equal(t, Route(""), router.RoutePreConnect("other.example.com"))
+}
+
+func TestRouter_RoutePreConnect_VMDirectIgnoredOutsideVMMode(t *testing.T) {
+	cfg := &Config{
+		Default: "proxy",
+		PreConnectVMDirect: []string{
+			"sso-vm.example.com",
+		},
+	}
+
+	// Without WithVMMode(), pre-connect-vm-direct patterns should be ignored
+	router := NewRouter(cfg)
+	assert.Equal(t, Route(""), router.RoutePreConnect("sso-vm.example.com"))
+}
+
+func TestDefaultRouter_RoutePreConnect(t *testing.T) {
+	router := NewDefaultRouter()
+	// DefaultRouter has no pre-connect overrides configured
+	assert.Equal(t, Route(""), router.RoutePreConnect("sso.example.com"))
+}

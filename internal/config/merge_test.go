@@ -152,6 +152,26 @@ func TestMerge_RoutingArraysMerged(t *testing.T) {
 	assert.Contains(t, result.Routing.Proxy, "*.cli.internal")
 }
 
+func TestMerge_RoutingPreConnectDirectMerged(t *testing.T) {
+	defaults := &Defaults{
+		Routing: &RoutingConfig{
+			PreConnectDirect: []string{"sso.example.com"},
+		},
+	}
+	profile := &Profile{
+		Routing: &RoutingConfig{
+			PreConnectDirect:   []string{"idp.company.com"},
+			PreConnectVMDirect: []string{"sso-vm.example.com"},
+		},
+	}
+
+	result := Merge(defaults, profile, &CLIFlags{})
+
+	assert.Contains(t, result.Routing.PreConnectDirect, "sso.example.com")
+	assert.Contains(t, result.Routing.PreConnectDirect, "idp.company.com")
+	assert.Contains(t, result.Routing.PreConnectVMDirect, "sso-vm.example.com")
+}
+
 func TestMerge_LazyBoolOverrides(t *testing.T) {
 	tests := []struct {
 		name         string
