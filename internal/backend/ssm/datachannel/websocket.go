@@ -151,6 +151,8 @@ func (w *WebSocketChannel) SetOnMessage(handler func([]byte)) {
 
 // StartReceiving starts the receive loop (blocking)
 func (w *WebSocketChannel) StartReceiving() {
+	prof := newRecvProfiler() // no-op unless AWSOCKS_DC_PROFILE=1
+
 	for {
 		w.mu.RLock()
 		conn := w.conn
@@ -161,6 +163,8 @@ func (w *WebSocketChannel) StartReceiving() {
 		if conn == nil || closed {
 			return
 		}
+
+		readStart := prof.beforeRead()
 
 		_, data, err := conn.ReadMessage()
 		if err != nil {
@@ -177,8 +181,12 @@ func (w *WebSocketChannel) StartReceiving() {
 			return
 		}
 
+		prof.afterRead(readStart, len(data))
+
 		if onMessage != nil {
+			msgStart := prof.beforeOnMessage()
 			onMessage(data)
+			prof.afterOnMessage(msgStart)
 		}
 	}
 }
