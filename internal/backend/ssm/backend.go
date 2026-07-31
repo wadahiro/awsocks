@@ -22,8 +22,8 @@ var logger = log.For(log.ComponentSSM)
 type State int
 
 const (
-	StateIdle State = iota
-	StateStartingEC2 // EC2 instance is being started (lazy connection)
+	StateIdle        State = iota
+	StateStartingEC2       // EC2 instance is being started (lazy connection)
 	StateConnecting
 	StateHandshaking
 	StateActive
@@ -89,17 +89,22 @@ type Backend struct {
 	// DataChannel components
 	dataChannel *datachannel.DataChannel
 
-	// Data bridge (net.Pipe + transfer goroutine lifecycle)
-	bridge *dataBridge
+	// Data bridge (net.Pipe + transfer goroutine lifecycle).
+	// Accessed from multiple goroutines (connect goroutine during handshake,
+	// DataChannel receive goroutine via handleDisconnect), so all access goes
+	// through bridgeMu-guarded helpers: setBridge / getBridge / clearBridge.
+	// Never read or write b.bridge directly.
+	bridge   *dataBridge
+	bridgeMu sync.Mutex
 
 	// SSH client (lock-free read via atomic.Pointer)
 	sshClient atomic.Pointer[ssh.Client]
 	sshConfig *ssh.ClientConfig
 
 	// State management (lock-free read via atomic.Int32)
-	state       atomic.Int32   // stores State values
-	stateMu     sync.Mutex     // protects stateNotify close-and-recreate only
-	stateNotify chan struct{}   // closed on state change to broadcast to all waiters
+	state       atomic.Int32  // stores State values
+	stateMu     sync.Mutex    // protects stateNotify close-and-recreate only
+	stateNotify chan struct{} // closed on state change to broadcast to all waiters
 
 	// Credentials (lock-free read via atomic.Value)
 	credentials atomic.Value // stores aws.Credentials
@@ -549,32 +554,17 @@ func (b *Backend) tryConnect() error {
 		b.logError("DataChannel error: %v", err)
 	})
 
-	// Set up net.Pipe bridge for SSH <-> DataChannel
-	bridge, bridgeCtx := newDataBridge(b.ctx)
-	b.bridge = bridge
-
-	// Set up DataChannel output callback: DataChannel → dcConn
-	// Capture bridge in closure to avoid nil-check races on b.bridge.
-	dc.SetOnOutputData(func(data []byte) {
-		if _, err := bridge.dcConn.Write(data); err != nil {
-			select {
-			case <-b.ctx.Done():
-			default:
-				logger.Debug("DataChannel output write error", "error", err)
-			}
-		}
-	})
-
-	// Start transfer goroutine: dcConn → DataChannel
-	bridge.startTransfer(bridgeCtx, dc, func(format string, args ...interface{}) {
-		logger.Debug(fmt.Sprintf(format, args...))
-	})
+	// Set up the initial net.Pipe bridge for SSH <-> DataChannel.
+	// installBridge wires the DataChannel output callback and transfer goroutine
+	// to the given bridge, then makes it the current bridge (closing any prior
+	// one). connectSSH reuses it for each retry.
+	initialBridge, initialBridgeCtx := newDataBridge(b.ctx)
+	b.installBridge(dc, initialBridge, initialBridgeCtx)
 
 	// Establish SSH over the bridge (sshConn side of net.Pipe)
 	b.logInfo("Starting SSH handshake...")
 	if err := b.connectSSH(dc); err != nil {
-		bridge.Close()
-		b.bridge = nil
+		b.clearBridge()
 		dc.Close()
 		return fmt.Errorf("failed to connect SSH: %w", err)
 	}
@@ -604,7 +594,6 @@ func (b *Backend) startSSMSession() (*SSMSession, error) {
 	return StartSSMSession(b.ctx, b.ssmClient, b.config.InstanceID, b.config.Region, creds)
 }
 
-
 // connectSSH establishes SSH over the net.Pipe bridge
 // It retries SSH handshake with short intervals since SSM agent may not be ready immediately.
 // Each attempt has a timeout to prevent hanging when the WebSocket disconnects
@@ -623,7 +612,13 @@ func (b *Backend) connectSSH(dc *datachannel.DataChannel) error {
 
 	var lastErr error
 	for attempt := 1; attempt <= sshMaxRetries; attempt++ {
-		bridge := b.bridge
+		bridge := b.getBridge()
+		if bridge == nil {
+			// Bridge was cleared concurrently (e.g., handleDisconnect during
+			// handshake, or cleanup via idle timeout / Close). Nothing to hand
+			// the SSH handshake to; stop retrying.
+			return fmt.Errorf("data bridge closed during SSH handshake")
+		}
 
 		// Run SSH handshake in a goroutine with timeout
 		resultCh := make(chan sshResult, 1)
@@ -646,13 +641,15 @@ func (b *Backend) connectSSH(dc *datachannel.DataChannel) error {
 			}
 			lastErr = result.err
 		case <-timer.C:
-			// Timeout: close bridge to unblock the goroutine
-			bridge.Close()
+			// Timeout: close bridge to unblock the goroutine. clearBridge closes
+			// the current bridge and the goroutine's ssh.NewClientConn returns as
+			// soon as the pipe is closed.
+			b.clearBridge()
 			<-resultCh // wait for goroutine to finish (pipe closed, so it returns quickly)
 			lastErr = fmt.Errorf("SSH handshake timeout after %v", sshHandshakeTimeout)
 		case <-b.ctx.Done():
 			// Context cancelled: close bridge to unblock the goroutine
-			bridge.Close()
+			b.clearBridge()
 			<-resultCh
 			return b.ctx.Err()
 		}
@@ -662,33 +659,24 @@ func (b *Backend) connectSSH(dc *datachannel.DataChannel) error {
 			// during handshake). Without this check, each retry would wait for the full
 			// sshHandshakeTimeout since no SSH response can arrive over a dead channel.
 			if !dc.IsOpen() {
+				b.clearBridge()
 				return fmt.Errorf("DataChannel closed during SSH handshake")
 			}
 
 			b.logDebug("SSH handshake attempt %d failed: %v, retrying...", attempt, lastErr)
 			time.Sleep(sshRetryInterval)
 
-			// Recreate the bridge for retry since SSH handshake corrupts the connection.
-			// The DataChannel output callback is re-registered with the new bridge's dcConn.
+			// Recreate the bridge for retry since SSH handshake corrupts the
+			// connection. installBridge closes the previous bridge (stopping its
+			// transfer goroutine) before installing the new one, so no zombie
+			// goroutine survives to write to the DataChannel.
 			newBridge, bridgeCtx := newDataBridge(b.ctx)
-			b.bridge = newBridge
-
-			dc.SetOnOutputData(func(data []byte) {
-				if _, err := newBridge.dcConn.Write(data); err != nil {
-					select {
-					case <-b.ctx.Done():
-					default:
-						logger.Debug("DataChannel output write error", "error", err)
-					}
-				}
-			})
-
-			newBridge.startTransfer(bridgeCtx, dc, func(format string, args ...interface{}) {
-				logger.Debug(fmt.Sprintf(format, args...))
-			})
+			b.installBridge(dc, newBridge, bridgeCtx)
 		}
 	}
 
+	// Exhausted retries: leave no live bridge behind.
+	b.clearBridge()
 	return fmt.Errorf("SSH handshake failed after %d attempts: %w", sshMaxRetries, lastErr)
 }
 
@@ -772,10 +760,7 @@ func (b *Backend) handleDisconnect() {
 	switch state {
 	case StateHandshaking:
 		b.logWarn("DataChannel disconnected during SSH handshake")
-		if bridge := b.bridge; bridge != nil {
-			bridge.Close()
-			b.bridge = nil
-		}
+		b.clearBridge()
 		if dc := b.dataChannel; dc != nil {
 			dc.Close()
 		}
@@ -815,6 +800,70 @@ func (b *Backend) triggerReconnect() {
 	go b.connect()
 }
 
+// setBridge atomically replaces the current bridge with newBridge, closing the
+// previous one first. This is the ONLY way a new bridge should be installed:
+// it prevents leaking the old net.Pipe and its transfer goroutine (which would
+// otherwise linger reading dcConn and racing to write to the DataChannel as a
+// zombie second writer during SSH handshake retries).
+func (b *Backend) setBridge(newBridge *dataBridge) {
+	b.bridgeMu.Lock()
+	old := b.bridge
+	b.bridge = newBridge
+	b.bridgeMu.Unlock()
+
+	if old != nil {
+		old.Close()
+	}
+}
+
+// getBridge returns the current bridge under lock.
+func (b *Backend) getBridge() *dataBridge {
+	b.bridgeMu.Lock()
+	defer b.bridgeMu.Unlock()
+	return b.bridge
+}
+
+// installBridge wires the DataChannel's output callback and transfer goroutine
+// to the given bridge and makes it the current one (closing any previous
+// bridge via setBridge). Centralizing this here means the callback and the
+// live bridge can never point at different net.Pipes, and every retry reuses
+// the same, leak-free setup.
+func (b *Backend) installBridge(dc *datachannel.DataChannel, bridge *dataBridge, bridgeCtx context.Context) {
+	// DataChannel output: DataChannel → dcConn. Capture bridge in the closure
+	// so the write target always matches the bridge we are installing.
+	dc.SetOnOutputData(func(data []byte) {
+		if _, err := bridge.dcConn.Write(data); err != nil {
+			select {
+			case <-b.ctx.Done():
+			default:
+				logger.Debug("DataChannel output write error", "error", err)
+			}
+		}
+	})
+
+	// Transfer goroutine: dcConn → DataChannel.
+	bridge.startTransfer(bridgeCtx, dc, func(format string, args ...interface{}) {
+		logger.Debug(fmt.Sprintf(format, args...))
+	})
+
+	// Make it current, closing the previous bridge (stops its zombie goroutine).
+	b.setBridge(bridge)
+}
+
+// clearBridge closes and removes the current bridge. Idempotent: calling it
+// when there is no bridge (or after it was already cleared) is a no-op, so
+// concurrent cleanup paths cannot double-close a live bridge.
+func (b *Backend) clearBridge() {
+	b.bridgeMu.Lock()
+	old := b.bridge
+	b.bridge = nil
+	b.bridgeMu.Unlock()
+
+	if old != nil {
+		old.Close()
+	}
+}
+
 // cleanup closes all resources.
 // Uses local variable capture to avoid TOCTOU race conditions when called
 // concurrently from multiple goroutines (e.g., triggerReconnect and Close).
@@ -823,10 +872,7 @@ func (b *Backend) cleanup() {
 		client.Close()
 	}
 
-	if bridge := b.bridge; bridge != nil {
-		b.bridge = nil
-		bridge.Close()
-	}
+	b.clearBridge()
 
 	if dc := b.dataChannel; dc != nil {
 		b.dataChannel = nil

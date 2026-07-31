@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"net"
 	"os"
+	"runtime"
 	"testing"
 	"time"
 
@@ -395,11 +396,12 @@ func newTestBackendWithPipe(t *testing.T) (*Backend, net.Conn) {
 
 	// Create dataBridge (simulating what tryConnect does)
 	bridge, _ := newDataBridge(ctx)
-	b.bridge = bridge
 
 	// Note: transfer goroutine is not started because there's no DataChannel in unit tests.
 	// Close done channel so bridge.Close() won't block waiting for the goroutine.
 	close(bridge.done)
+
+	b.setBridge(bridge)
 
 	return b, bridge.dcConn
 }
@@ -440,7 +442,7 @@ func TestConnectSSH_PipeClosedReturnsError(t *testing.T) {
 
 	// Close the bridge after a short delay to simulate onDisconnect handler
 	time.Sleep(100 * time.Millisecond)
-	b.bridge.Close()
+	b.clearBridge()
 
 	select {
 	case err := <-errCh:
@@ -502,8 +504,8 @@ func TestTryConnect_CleanupDuringSSHHandshake_NoPanic(t *testing.T) {
 	b.dataChannel = dc
 
 	bridge, _ := newDataBridge(ctx)
-	b.bridge = bridge
 	close(bridge.done)
+	b.setBridge(bridge)
 
 	// Start connectSSH in a goroutine
 	errCh := make(chan error, 1)
@@ -552,14 +554,14 @@ func TestHandleDisconnect_DuringHandshake(t *testing.T) {
 
 	// Create a bridge so handleDisconnect has something to close
 	bridge, _ := newDataBridge(ctx)
-	b.bridge = bridge
 	close(bridge.done) // no transfer goroutine in test
+	b.setBridge(bridge)
 
 	// Call handleDisconnect
 	b.handleDisconnect()
 
 	// Bridge should be cleaned up (nil)
-	assert.Nil(t, b.bridge)
+	assert.Nil(t, b.getBridge())
 }
 
 func TestHandleDisconnect_DuringActive(t *testing.T) {
@@ -585,4 +587,107 @@ func TestHandleDisconnect_DuringActive(t *testing.T) {
 	state := b.State()
 	assert.True(t, state == StateConnecting || state == StateReconnecting,
 		"expected Connecting or Reconnecting, got %s", state)
+}
+
+// waitForGoroutineCount polls until the goroutine count drops to at or below
+// target, or the deadline expires. Returns the final observed count.
+func waitForGoroutineCount(target int, deadline time.Duration) int {
+	stop := time.Now().Add(deadline)
+	n := runtime.NumGoroutine()
+	for n > target && time.Now().Before(stop) {
+		time.Sleep(20 * time.Millisecond)
+		runtime.GC()
+		n = runtime.NumGoroutine()
+	}
+	return n
+}
+
+// TestInstallBridge_ClosesPreviousBridge is a regression test for the bridge
+// leak: before the fix, each SSH handshake retry created a new dataBridge (and
+// its transfer goroutine) via `b.bridge = newBridge` WITHOUT closing the old
+// one, leaving zombie transfer goroutines reading the old dcConn and racing to
+// write to the DataChannel. installBridge now closes the previous bridge, so
+// repeatedly installing bridges must not grow the goroutine count.
+func TestInstallBridge_ClosesPreviousBridge(t *testing.T) {
+	cfg := &Config{InstanceID: "i-test", Region: "ap-northeast-1", SSHUser: "ec2-user"}
+	b := New(cfg, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	b.ctx = ctx
+	b.cancel = cancel
+
+	// A real DataChannel so each installed bridge's startTransfer goroutine runs.
+	// It is never Open()ed: SendInputData fails, so a transfer goroutine only
+	// exits when its bridge's dcConn is closed (i.e. when the bridge is closed).
+	dc := datachannel.NewDataChannel()
+	b.dataChannel = dc
+
+	baseline := runtime.NumGoroutine()
+
+	// Simulate the initial install plus several handshake-retry re-installs.
+	var first *dataBridge
+	for i := 0; i < 5; i++ {
+		bridge, bridgeCtx := newDataBridge(ctx)
+		if i == 0 {
+			first = bridge
+		}
+		b.installBridge(dc, bridge, bridgeCtx)
+	}
+
+	// The first bridge must have been closed by a later install: its transfer
+	// goroutine has exited, so its done channel is closed.
+	select {
+	case <-first.done:
+		// closed as expected
+	case <-time.After(2 * time.Second):
+		t.Fatal("first bridge's transfer goroutine did not exit - bridge was leaked")
+	}
+
+	// Clean up the last (still-live) bridge.
+	b.clearBridge()
+
+	// Goroutine count must return to baseline: no zombie transfer goroutines
+	// accumulated across the re-installs.
+	final := waitForGoroutineCount(baseline+1, 5*time.Second)
+	assert.LessOrEqualf(t, final, baseline+1,
+		"goroutine count grew from baseline %d to %d - transfer goroutines leaked across installs",
+		baseline, final)
+}
+
+// TestConnectSSH_ExhaustedRetriesLeavesNoBridge asserts the current bridge is
+// cleared (not left pointing at a closed bridge) once all handshake attempts
+// fail, so a subsequent reconnect starts from a clean slate.
+func TestConnectSSH_ExhaustedRetriesLeavesNoBridge(t *testing.T) {
+	origMaxRetries := sshMaxRetries
+	origRetryInterval := sshRetryInterval
+	origHandshakeTimeout := sshHandshakeTimeout
+	t.Cleanup(func() {
+		sshMaxRetries = origMaxRetries
+		sshRetryInterval = origRetryInterval
+		sshHandshakeTimeout = origHandshakeTimeout
+	})
+	sshMaxRetries = 2
+	sshRetryInterval = 10 * time.Millisecond
+	sshHandshakeTimeout = 150 * time.Millisecond
+
+	cfg := &Config{InstanceID: "i-test", Region: "ap-northeast-1", SSHUser: "ec2-user"}
+	b := New(cfg, nil)
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	b.ctx = ctx
+	b.cancel = cancel
+	b.sshConfig = newTestSSHConfig(t)
+
+	// A real (never-Open()ed) DataChannel: the retry path calls dc.IsOpen(),
+	// which must not be nil. It reports open here (ctx set on... actually not
+	// Open()ed so IsOpen()=false), letting the retry loop take the
+	// "DataChannel closed" early-return, which still must clear the bridge.
+	dc := datachannel.NewDataChannel()
+	b.dataChannel = dc
+	initialBridge, initialCtx := newDataBridge(ctx)
+	b.installBridge(dc, initialBridge, initialCtx)
+
+	err := b.connectSSH(dc)
+	require.Error(t, err)
+	assert.Nil(t, b.getBridge())
 }
