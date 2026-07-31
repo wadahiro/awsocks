@@ -379,5 +379,5 @@ func (c *MuxConn) RemoteAddr() net.Addr {
 }
 
 func (c *MuxConn) SetDeadline(t time.Time) error      { return nil }
-func (c *MuxConn) SetReadDeadline(t time.Time) error   { return nil }
-func (c *MuxConn) SetWriteDeadline(t time.Time) error  { return nil }
+func (c *MuxConn) SetReadDeadline(t time.Time) error  { return nil }
+func (c *MuxConn) SetWriteDeadline(t time.Time) error { return nil }

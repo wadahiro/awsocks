@@ -362,7 +362,7 @@ type mockFullBackend struct {
 	dialFunc func(ctx context.Context, network, addr string) (net.Conn, error)
 }
 
-func (m *mockFullBackend) Name() string { return "mock" }
+func (m *mockFullBackend) Name() string                    { return "mock" }
 func (m *mockFullBackend) Start(ctx context.Context) error { return nil }
 func (m *mockFullBackend) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	if m.dialFunc != nil {

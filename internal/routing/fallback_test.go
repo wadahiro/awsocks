@@ -89,18 +89,18 @@ func TestFallbackRoute_DirectMode(t *testing.T) {
 	router := NewRouter(&Config{Default: "proxy"})
 
 	tests := []struct {
-		name           string
-		currentRoute   Route
+		name             string
+		currentRoute     Route
 		expectedFallback Route
 	}{
 		{
-			name:           "proxy -> direct",
-			currentRoute:   RouteProxy,
+			name:             "proxy -> direct",
+			currentRoute:     RouteProxy,
 			expectedFallback: RouteDirect,
 		},
 		{
-			name:           "direct -> proxy",
-			currentRoute:   RouteDirect,
+			name:             "direct -> proxy",
+			currentRoute:     RouteDirect,
 			expectedFallback: RouteProxy,
 		},
 	}
@@ -117,23 +117,23 @@ func TestFallbackRoute_VMMode(t *testing.T) {
 	router := NewRouter(&Config{Default: "proxy"}, WithVMMode())
 
 	tests := []struct {
-		name           string
-		currentRoute   Route
+		name             string
+		currentRoute     Route
 		expectedFallback Route
 	}{
 		{
-			name:           "proxy -> vm-direct",
-			currentRoute:   RouteProxy,
+			name:             "proxy -> vm-direct",
+			currentRoute:     RouteProxy,
 			expectedFallback: RouteVMDirect,
 		},
 		{
-			name:           "vm-direct -> proxy",
-			currentRoute:   RouteVMDirect,
+			name:             "vm-direct -> proxy",
+			currentRoute:     RouteVMDirect,
 			expectedFallback: RouteProxy,
 		},
 		{
-			name:           "direct -> no fallback (explicit config)",
-			currentRoute:   RouteDirect,
+			name:             "direct -> no fallback (explicit config)",
+			currentRoute:     RouteDirect,
 			expectedFallback: "",
 		},
 	}

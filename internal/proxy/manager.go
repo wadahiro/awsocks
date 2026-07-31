@@ -77,10 +77,10 @@ var logger = log.For(log.ComponentManager)
 // Manager manages the proxy lifecycle
 type Manager struct {
 	cfg                *Config
-	vm                 *vm.ProxyVM         // only when needsVM
-	agentMux           *mux.AgentMux       // only when needsVM (shared multiplexer)
-	awsClient          *awsapi.Client      // only when needsProxy
-	backend            backend.Backend     // only when needsProxy
+	vm                 *vm.ProxyVM     // only when needsVM
+	agentMux           *mux.AgentMux   // only when needsVM (shared multiplexer)
+	awsClient          *awsapi.Client  // only when needsProxy
+	backend            backend.Backend // only when needsProxy
 	credProv           *credentials.Provider
 	socks5             *SOCKS5Server
 	httpProxy          *HTTPProxyServer
@@ -93,10 +93,10 @@ type Manager struct {
 	cancel             context.CancelFunc
 
 	// Lazy initialization state
-	awsInitialized   bool
-	awsInitMu        sync.Mutex
-	initDone         chan struct{}
-	initErr          error
+	awsInitialized    bool
+	awsInitMu         sync.Mutex
+	initDone          chan struct{}
+	initErr           error
 	initializeProxyFn func(ctx context.Context) error // override for testing
 }
 
@@ -375,12 +375,12 @@ func (m *Manager) initializeProxy(ctx context.Context) error {
 	// Create and start SSM backend
 	if instanceID != "" {
 		backendCfg := &awsapi.SSMBackendConfig{
-			InstanceID:           instanceID,
-			Region:               m.cfg.Region,
-			SSHUser:              m.cfg.SSHUser,
-			SSHKeyPath:           m.cfg.SSHKeyPath,
-			AutoStartEC2:         m.cfg.AutoStart,
-			SSHKeepaliveInterval: m.cfg.SSHKeepaliveInterval,
+			InstanceID:            instanceID,
+			Region:                m.cfg.Region,
+			SSHUser:               m.cfg.SSHUser,
+			SSHKeyPath:            m.cfg.SSHKeyPath,
+			AutoStartEC2:          m.cfg.AutoStart,
+			SSHKeepaliveInterval:  m.cfg.SSHKeepaliveInterval,
 			UpstreamProxyURL:      upstreamProxyURL(m.cfg.UpstreamProxy),
 			UpstreamProxyPatterns: upstreamProxyPatterns(m.cfg.UpstreamProxy),
 		}

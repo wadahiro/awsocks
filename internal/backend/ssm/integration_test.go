@@ -666,9 +666,9 @@ func TestIntegration_NoRouteErrors(t *testing.T) {
 	// These use short timeouts because SSH direct-tcpip can take a long time to timeout
 	t.Run("UnreachableHosts", func(t *testing.T) {
 		unreachableHosts := []string{
-			"10.255.255.1:443",  // RFC 5737 test network - should be unreachable
-			"192.0.2.1:443",     // RFC 5737 TEST-NET-1
-			"198.51.100.1:443",  // RFC 5737 TEST-NET-2
+			"10.255.255.1:443", // RFC 5737 test network - should be unreachable
+			"192.0.2.1:443",    // RFC 5737 TEST-NET-1
+			"198.51.100.1:443", // RFC 5737 TEST-NET-2
 		}
 
 		for i, host := range unreachableHosts {

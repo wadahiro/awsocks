@@ -43,7 +43,7 @@ func WithVMMode() RouterOption {
 // NewRouter creates a new router from configuration
 func NewRouter(cfg *Config, opts ...RouterOption) *DefaultRouter {
 	r := &DefaultRouter{
-		defaultRoute:   Route(cfg.Default),
+		defaultRoute: Route(cfg.Default),
 	}
 
 	for _, opt := range opts {

@@ -58,7 +58,7 @@ type Profile struct {
 type Defaults struct {
 	SSHUser      string `toml:"ssh-user"`
 	Listen       string `toml:"listen"`
-	HTTPListen   string `toml:"http-listen"` // HTTP CONNECT proxy listen address
+	HTTPListen   string `toml:"http-listen"`   // HTTP CONNECT proxy listen address
 	ProxyNetwork string `toml:"proxy-network"` // "direct" (default) or "vm"
 	RemotePort   int    `toml:"remote-port"`
 	Lazy         *bool  `toml:"lazy"`

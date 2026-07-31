@@ -26,57 +26,57 @@ type StreamingMessage struct {
 
 // DataChannel manages the communication channel with SSM agent
 type DataChannel struct {
-	ws            *WebSocketChannel
-	mu            sync.RWMutex
+	ws *WebSocketChannel
+	mu sync.RWMutex
 
 	// Sequence tracking
-	sendSeqNum           int64
-	expectedSeqNum       int64
-	incomingBuffer       map[int64]*ClientMessage
-	pendingMessages      map[string]*pendingMessage
+	sendSeqNum      int64
+	expectedSeqNum  int64
+	incomingBuffer  map[int64]*ClientMessage
+	pendingMessages map[string]*pendingMessage
 
 	// Handshake
-	clientVersion        string
-	handshakeProcessor   *HandshakeProcessor
-	handshakeComplete    bool
+	clientVersion      string
+	handshakeProcessor *HandshakeProcessor
+	handshakeComplete  bool
 
 	// Callbacks
-	onOutputData         func([]byte)
-	onHandshakeComplete  func()
-	onError              func(error)
-	onDisconnect         func()
-	onResendTimeout      func()
+	onOutputData        func([]byte)
+	onHandshakeComplete func()
+	onError             func(error)
+	onDisconnect        func()
+	onResendTimeout     func()
 
 	// Lifecycle context: cancelling stops all goroutines (resend, receiver)
 	ctx    context.Context
 	cancel context.CancelFunc
 
 	// Retransmission mechanism
-	outgoingBuffer            *list.List
-	outgoingMu                sync.Mutex
-	roundTripTime             float64 // in milliseconds
-	roundTripTimeVariation    float64 // in milliseconds
-	retransmissionTimeout     time.Duration
+	outgoingBuffer         *list.List
+	outgoingMu             sync.Mutex
+	roundTripTime          float64 // in milliseconds
+	roundTripTimeVariation float64 // in milliseconds
+	retransmissionTimeout  time.Duration
 }
 
 // pendingMessage tracks a sent message awaiting acknowledgment
 type pendingMessage struct {
-	message   *ClientMessage
-	sentAt    time.Time
-	attempts  int
+	message  *ClientMessage
+	sentAt   time.Time
+	attempts int
 }
 
 // NewDataChannel creates a new DataChannel
 func NewDataChannel() *DataChannel {
 	return &DataChannel{
-		ws:                      NewWebSocketChannel(),
-		incomingBuffer:          make(map[int64]*ClientMessage),
-		pendingMessages:         make(map[string]*pendingMessage),
-		clientVersion:           "1.0.0",
-		outgoingBuffer:          list.New(),
-		roundTripTime:           DefaultRoundTripTime,
-		roundTripTimeVariation:  DefaultRoundTripTimeVariation,
-		retransmissionTimeout:   DefaultTransmissionTimeout,
+		ws:                     NewWebSocketChannel(),
+		incomingBuffer:         make(map[int64]*ClientMessage),
+		pendingMessages:        make(map[string]*pendingMessage),
+		clientVersion:          "1.0.0",
+		outgoingBuffer:         list.New(),
+		roundTripTime:          DefaultRoundTripTime,
+		roundTripTimeVariation: DefaultRoundTripTimeVariation,
+		retransmissionTimeout:  DefaultTransmissionTimeout,
 	}
 }
 

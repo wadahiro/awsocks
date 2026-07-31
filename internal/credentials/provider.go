@@ -19,17 +19,17 @@ var logger = log.For(log.ComponentCredentials)
 
 // Provider watches AWS credential files and provides auto-refresh
 type Provider struct {
-	profile         string
-	region          string
-	awsDir          string
-	refreshCh       chan aws.Credentials
-	watcher         *fsnotify.Watcher
-	lastCreds       aws.Credentials
-	lastCredsTime   time.Time
-	lastConfig      *aws.Config
-	mu              sync.RWMutex
-	retryInterval   time.Duration
-	expiryBuffer    time.Duration
+	profile       string
+	region        string
+	awsDir        string
+	refreshCh     chan aws.Credentials
+	watcher       *fsnotify.Watcher
+	lastCreds     aws.Credentials
+	lastCredsTime time.Time
+	lastConfig    *aws.Config
+	mu            sync.RWMutex
+	retryInterval time.Duration
+	expiryBuffer  time.Duration
 }
 
 // NewProvider creates a new credential provider

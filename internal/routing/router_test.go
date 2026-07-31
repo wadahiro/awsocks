@@ -61,10 +61,10 @@ func TestDomainMatcher(t *testing.T) {
 
 func TestCIDRMatcher(t *testing.T) {
 	tests := []struct {
-		name    string
-		cidr    string
-		host    string
-		want    bool
+		name string
+		cidr string
+		host string
+		want bool
 	}{
 		// IPv4
 		{"ipv4 in range", "10.0.0.0/8", "10.1.2.3", true},
@@ -304,7 +304,7 @@ func TestDefaultRouter_WithoutVMMode_FallbackRoute(t *testing.T) {
 
 func TestRouter_ResolveHost(t *testing.T) {
 	tests := []struct {
-		name string
+		name  string
 		hosts map[string]string
 		host  string
 		want  string

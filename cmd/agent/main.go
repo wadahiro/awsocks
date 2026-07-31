@@ -193,4 +193,3 @@ func connectToHost() (net.Conn, error) {
 
 	return nil, fmt.Errorf("failed to connect after 30 attempts: %w", err)
 }
-

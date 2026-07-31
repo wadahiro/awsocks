@@ -143,12 +143,12 @@ func (c *Client) WaitForSSMAgent(ctx context.Context, instanceID string, timeout
 
 // SSMBackendConfig holds configuration for creating a new SSM backend.
 type SSMBackendConfig struct {
-	InstanceID           string
-	Region               string
-	SSHUser              string
-	SSHKeyPath           string
-	AutoStartEC2         bool
-	SSHKeepaliveInterval time.Duration
+	InstanceID            string
+	Region                string
+	SSHUser               string
+	SSHKeyPath            string
+	AutoStartEC2          bool
+	SSHKeepaliveInterval  time.Duration
 	UpstreamProxyURL      string   // e.g., "http://localhost:8080"
 	UpstreamProxyPatterns []string // e.g., ["*.internal.example.com"]
 }
@@ -156,11 +156,11 @@ type SSMBackendConfig struct {
 // NewSSMBackend creates a new SSM backend with the client's dial function injected.
 func (c *Client) NewSSMBackend(cfg *SSMBackendConfig) *ssmbackend.Backend {
 	backendConfig := &ssmbackend.Config{
-		InstanceID:           cfg.InstanceID,
-		Region:               cfg.Region,
-		SSHUser:              cfg.SSHUser,
-		SSHKeyPath:           cfg.SSHKeyPath,
-		SSHKeepaliveInterval: cfg.SSHKeepaliveInterval,
+		InstanceID:            cfg.InstanceID,
+		Region:                cfg.Region,
+		SSHUser:               cfg.SSHUser,
+		SSHKeyPath:            cfg.SSHKeyPath,
+		SSHKeepaliveInterval:  cfg.SSHKeepaliveInterval,
 		UpstreamProxyURL:      cfg.UpstreamProxyURL,
 		UpstreamProxyPatterns: cfg.UpstreamProxyPatterns,
 	}

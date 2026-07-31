@@ -19,12 +19,12 @@ import (
 
 // mockWebSocket is a test WebSocket server that simulates SSM agent behavior
 type mockWebSocket struct {
-	server      *httptest.Server
-	conn        *websocket.Conn
-	connMu      sync.Mutex
-	received    [][]byte
-	receivedMu  sync.Mutex
-	toSend      chan []byte
+	server        *httptest.Server
+	conn          *websocket.Conn
+	connMu        sync.Mutex
+	received      [][]byte
+	receivedMu    sync.Mutex
+	toSend        chan []byte
 	handshakeDone atomic.Bool
 }
 

@@ -154,12 +154,12 @@ func TestMerge_RoutingArraysMerged(t *testing.T) {
 
 func TestMerge_LazyBoolOverrides(t *testing.T) {
 	tests := []struct {
-		name          string
-		defaultsLazy  *bool
-		profileLazy   *bool
-		cliLazy       *bool
-		cliLazyIsSet  bool
-		expectedLazy  bool
+		name         string
+		defaultsLazy *bool
+		profileLazy  *bool
+		cliLazy      *bool
+		cliLazyIsSet bool
+		expectedLazy bool
 	}{
 		{
 			name:         "CLI true overrides all",
@@ -265,10 +265,10 @@ func TestMerge_AutoStartStop(t *testing.T) {
 
 func TestMerge_IdleTimeout(t *testing.T) {
 	tests := []struct {
-		name             string
-		defaultsTimeout  string
-		profileTimeout   string
-		expectedTimeout  time.Duration
+		name            string
+		defaultsTimeout string
+		profileTimeout  string
+		expectedTimeout time.Duration
 	}{
 		{
 			name:            "defaults only",
@@ -317,11 +317,11 @@ func TestMerge_IdleTimeout(t *testing.T) {
 
 func TestMerge_ProxyNetwork(t *testing.T) {
 	tests := []struct {
-		name             string
-		defaultsRoute    string
-		profileRoute     string
-		cliRoute         string
-		expectedRoute    string
+		name          string
+		defaultsRoute string
+		profileRoute  string
+		cliRoute      string
+		expectedRoute string
 	}{
 		{
 			name:          "CLI overrides profile",
@@ -379,8 +379,8 @@ func TestMerge_RoutingHostsMerged(t *testing.T) {
 
 	result := Merge(defaults, profile, cli)
 
-	assert.Equal(t, "10.0.1.50", result.Routing.Hosts["api.internal"])   // from defaults
-	assert.Equal(t, "10.0.2.100", result.Routing.Hosts["db.internal"])   // profile overrides
+	assert.Equal(t, "10.0.1.50", result.Routing.Hosts["api.internal"])  // from defaults
+	assert.Equal(t, "10.0.2.100", result.Routing.Hosts["db.internal"])  // profile overrides
 	assert.Equal(t, "10.0.2.200", result.Routing.Hosts["web.internal"]) // from profile
 }
 

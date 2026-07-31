@@ -144,7 +144,7 @@ func ParseConnectPayload(payload []byte) (network, address string, err error) {
 
 // LogPayload contains log message from agent
 type LogPayload struct {
-	Level   string `json:"level"`   // "debug", "info", "warn", "error"
+	Level   string `json:"level"` // "debug", "info", "warn", "error"
 	Message string `json:"message"`
 }
 

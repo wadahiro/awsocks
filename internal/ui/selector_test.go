@@ -33,10 +33,10 @@ func TestFormatInstanceList(t *testing.T) {
 
 func TestParseSelection_Valid(t *testing.T) {
 	tests := []struct {
-		name      string
-		input     string
-		max       int
-		expected  int
+		name     string
+		input    string
+		max      int
+		expected int
 	}{
 		{
 			name:     "single digit",

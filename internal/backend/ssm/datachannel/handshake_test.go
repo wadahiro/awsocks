@@ -9,11 +9,11 @@ import (
 
 func TestHandshakeRequest_Parse(t *testing.T) {
 	testCases := []struct {
-		name             string
-		payload          string
-		expectedVersion  string
-		expectedActions  int
-		expectedError    bool
+		name            string
+		payload         string
+		expectedVersion string
+		expectedActions int
+		expectedError   bool
 	}{
 		{
 			name:            "basic request",
