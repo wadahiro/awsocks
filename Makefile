@@ -4,7 +4,7 @@ BIN_DIR := bin
 ISO_URL := https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-virt-$(ALPINE_VERSION)-x86_64.iso
 MINIROOTFS_URL := https://dl-cdn.alpinelinux.org/alpine/v3.19/releases/x86_64/alpine-minirootfs-$(ALPINE_VERSION)-x86_64.tar.gz
 
-.PHONY: all build build-cli build-agent clean assets kernel rootfs initramfs sign test test-unit test-integration test-coverage
+.PHONY: all build build-cli build-agent clean assets kernel rootfs initramfs sign test test-unit test-integration test-coverage fmt fmt-check
 
 # Default target: build CLI for macOS
 all: build-cli sign
@@ -37,6 +37,20 @@ test-integration:
 
 # All tests
 test: test-unit
+
+# Format all Go source files in place
+fmt:
+	gofmt -w .
+
+# Fail if any Go source file is not gofmt-formatted (used in CI/pre-commit)
+fmt-check:
+	@unformatted=$$(gofmt -l .); \
+	if [ -n "$$unformatted" ]; then \
+		echo "The following files are not gofmt-formatted:"; \
+		echo "$$unformatted"; \
+		echo "Run 'make fmt' to fix."; \
+		exit 1; \
+	fi
 
 # Coverage report
 test-coverage:

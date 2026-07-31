@@ -8,6 +8,8 @@ SOCKS5 proxy via AWS SSM for secure EC2 access.
 make                 # Build awsocks binary
 make test-unit       # Run unit tests
 make build-agent     # Build Linux agent for VM
+make fmt             # gofmt -w . (run before committing)
+make fmt-check       # Fail if any file is not gofmt-formatted
 ```
 
 ## Architecture

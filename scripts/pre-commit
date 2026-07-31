@@ -1,0 +1,20 @@
+#!/bin/sh
+# gofmt check for staged Go files.
+# Install: ln -sf ../../scripts/pre-commit .git/hooks/pre-commit
+
+set -e
+
+staged_go_files=$(git diff --cached --name-only --diff-filter=ACM -- '*.go')
+
+if [ -z "$staged_go_files" ]; then
+	exit 0
+fi
+
+unformatted=$(gofmt -l $staged_go_files)
+
+if [ -n "$unformatted" ]; then
+	echo "gofmt: the following staged files are not formatted:"
+	echo "$unformatted"
+	echo "Run 'make fmt' (or 'gofmt -w <file>') and re-stage."
+	exit 1
+fi
