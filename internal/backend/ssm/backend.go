@@ -258,7 +258,18 @@ func (b *Backend) Dial(ctx context.Context, network, address string) (net.Conn, 
 			return nil, fmt.Errorf("backend not ready: %w", err)
 		}
 	case state == StateError:
-		return nil, fmt.Errorf("backend in error state")
+		// CAS to atomically transition Error → Connecting (only one goroutine wins)
+		if b.state.CompareAndSwap(int32(StateError), int32(StateConnecting)) {
+			b.logInfo("Retrying connection after previous error: instance=%s", b.config.InstanceID)
+			b.setState(StateConnecting)
+
+			go b.connectWithEC2Start()
+		}
+
+		// Wait for active state
+		if err := b.waitForActive(ctx); err != nil {
+			return nil, fmt.Errorf("retry after error failed: %w", err)
+		}
 	default:
 		// StateActive - proceed
 	}

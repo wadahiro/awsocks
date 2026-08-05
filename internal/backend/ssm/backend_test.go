@@ -164,6 +164,41 @@ func TestBackend_Dial_NotReady(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestBackend_Dial_FromError_RetriesConnection(t *testing.T) {
+	cfg := &Config{
+		InstanceID: "i-12345678",
+		Region:     "ap-northeast-1",
+		SSHUser:    "ec2-user",
+	}
+
+	b := New(cfg, nil)
+	ctx := context.Background()
+
+	err := b.Start(ctx)
+	assert.NoError(t, err)
+	defer b.Close()
+
+	// Simulate exhausted retries landing the backend in StateError
+	b.setState(StateError)
+	assert.Equal(t, StateError, b.State())
+
+	// Dial while in StateError should trigger a fresh connection attempt
+	// instead of failing immediately with a permanent error.
+	dialCtx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	_, err = b.Dial(dialCtx, "tcp", "example.com:80")
+	assert.Error(t, err)
+	assert.NotContains(t, err.Error(), "backend in error state")
+
+	// State should have moved out of StateError (into Connecting, and
+	// eventually back to Error once the retry loop exhausts, since there's
+	// no real SSM endpoint to connect to).
+	assert.Eventually(t, func() bool {
+		state := b.State()
+		return state == StateConnecting || state == StateError
+	}, time.Second, 10*time.Millisecond)
+}
+
 func TestState_String(t *testing.T) {
 	testCases := []struct {
 		state    State
