@@ -538,6 +538,7 @@ func (b *Backend) tryConnect() error {
 
 	b.logInfo("Opening DataChannel WebSocket... streamURL=%s", session.StreamURL[:min(len(session.StreamURL), 80)])
 	if err := dc.Open(b.ctx, session.StreamURL); err != nil {
+		b.terminateSSMSession(session.SessionID)
 		return fmt.Errorf("failed to open data channel: %w", err)
 	}
 	b.logInfo("DataChannel WebSocket connected")
@@ -550,6 +551,7 @@ func (b *Backend) tryConnect() error {
 	}
 	if err := dc.SendJSON(openMsg); err != nil {
 		dc.Close()
+		b.terminateSSMSession(session.SessionID)
 		return fmt.Errorf("failed to send open message: %w", err)
 	}
 	b.logInfo("OpenDataChannel message sent, waiting for handshake...")
@@ -561,9 +563,11 @@ func (b *Backend) tryConnect() error {
 		b.logInfo("SSM handshake complete")
 	case <-time.After(30 * time.Second):
 		dc.Close()
+		b.terminateSSMSession(session.SessionID)
 		return fmt.Errorf("handshake timeout")
 	case <-b.ctx.Done():
 		dc.Close()
+		b.terminateSSMSession(session.SessionID)
 		return b.ctx.Err()
 	}
 
@@ -584,6 +588,7 @@ func (b *Backend) tryConnect() error {
 	if err := b.connectSSH(dc); err != nil {
 		b.clearBridge()
 		dc.Close()
+		b.terminateSSMSession(session.SessionID)
 		return fmt.Errorf("failed to connect SSH: %w", err)
 	}
 	b.logInfo("SSH connection established")
@@ -610,6 +615,23 @@ func (b *Backend) startSSMSession() (*SSMSession, error) {
 	}
 
 	return StartSSMSession(b.ctx, b.ssmClient, b.config.InstanceID, b.config.Region, creds)
+}
+
+// terminateSSMSession closes the AWS-side SSM session for a connection
+// attempt abandoned before reaching StateActive (e.g. SSH handshake never
+// completed). Without this, the session lingers on the SSM agent side and
+// can contend with the session a subsequent retry creates. Uses a fresh
+// context with its own timeout since b.ctx may already be cancelled (e.g.
+// Backend.Close, or the ctx.Done() case above).
+func (b *Backend) terminateSSMSession(sessionID string) {
+	if b.ssmClient == nil {
+		return
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := TerminateSSMSession(ctx, b.ssmClient, sessionID); err != nil {
+		b.logDebug("Failed to terminate abandoned SSM session sessionID=%s: %v", sessionID, err)
+	}
 }
 
 // connectSSH establishes SSH over the net.Pipe bridge
