@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -84,9 +85,12 @@ func TestSOCKS5Server_StopBeforeStart(t *testing.T) {
 	})
 }
 
-// mockLazyInit implements LazyInitializer for testing
+// mockLazyInit implements LazyInitializer for testing.
+// initErr is guarded because Dial runs EnsureInitialized on its own goroutine,
+// which reads it concurrently with the test goroutine calling failInit.
 type mockLazyInit struct {
 	initDone    chan struct{}
+	mu          sync.Mutex
 	initErr     error
 	ensureCalls int32
 }
@@ -99,7 +103,7 @@ func newMockLazyInit() *mockLazyInit {
 
 func (m *mockLazyInit) EnsureInitialized(ctx context.Context) error {
 	atomic.AddInt32(&m.ensureCalls, 1)
-	return m.initErr
+	return m.InitError()
 }
 
 func (m *mockLazyInit) InitDone() <-chan struct{} {
@@ -107,6 +111,8 @@ func (m *mockLazyInit) InitDone() <-chan struct{} {
 }
 
 func (m *mockLazyInit) InitError() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.initErr
 }
 
@@ -115,7 +121,9 @@ func (m *mockLazyInit) completeInit() {
 }
 
 func (m *mockLazyInit) failInit(err error) {
+	m.mu.Lock()
 	m.initErr = err
+	m.mu.Unlock()
 	close(m.initDone)
 }
 

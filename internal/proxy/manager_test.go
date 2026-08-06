@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -170,9 +171,12 @@ func TestSOCKS5Server_FallsBackToDirectWhenNoBackend(t *testing.T) {
 	server.Stop()
 }
 
-// mockLazyInitForDirect implements LazyInitializer
+// mockLazyInitForDirect implements LazyInitializer.
+// initErr is guarded because Dial runs EnsureInitialized on its own goroutine,
+// which reads it concurrently with the test goroutine calling failInit.
 type mockLazyInitForDirect struct {
 	initDone    chan struct{}
+	mu          sync.Mutex
 	initErr     error
 	ensureCalls int32
 }
@@ -185,7 +189,7 @@ func newMockLazyInitForDirect() *mockLazyInitForDirect {
 
 func (m *mockLazyInitForDirect) EnsureInitialized(ctx context.Context) error {
 	atomic.AddInt32(&m.ensureCalls, 1)
-	return m.initErr
+	return m.InitError()
 }
 
 func (m *mockLazyInitForDirect) InitDone() <-chan struct{} {
@@ -193,6 +197,8 @@ func (m *mockLazyInitForDirect) InitDone() <-chan struct{} {
 }
 
 func (m *mockLazyInitForDirect) InitError() error {
+	m.mu.Lock()
+	defer m.mu.Unlock()
 	return m.initErr
 }
 
@@ -201,7 +207,9 @@ func (m *mockLazyInitForDirect) completeInit() {
 }
 
 func (m *mockLazyInitForDirect) failInit(err error) {
+	m.mu.Lock()
 	m.initErr = err
+	m.mu.Unlock()
 	close(m.initDone)
 }
 
