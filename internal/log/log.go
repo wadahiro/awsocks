@@ -21,6 +21,7 @@ const (
 	ComponentWebSocket   Component = "websocket"
 	ComponentEC2         Component = "ec2"
 	ComponentRouting     Component = "routing"
+	ComponentDNS         Component = "dns"
 )
 
 var defaultLogger atomic.Pointer[slog.Logger]

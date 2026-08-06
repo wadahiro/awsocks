@@ -12,6 +12,7 @@ import (
 	"github.com/wadahiro/awsocks/internal/backend"
 	"github.com/wadahiro/awsocks/internal/clock"
 	"github.com/wadahiro/awsocks/internal/credentials"
+	"github.com/wadahiro/awsocks/internal/dns"
 	ec2pkg "github.com/wadahiro/awsocks/internal/ec2"
 	"github.com/wadahiro/awsocks/internal/log"
 	"github.com/wadahiro/awsocks/internal/mux"
@@ -47,6 +48,9 @@ type Config struct {
 
 	// Routing settings
 	RoutingConfig *routing.Config
+
+	// DNS resolution settings (nil = resolution is left to each route)
+	DNSConfig *dns.Config
 
 	// Lazy connection settings
 	LazyConnect bool // --lazy
@@ -204,6 +208,51 @@ func (m *Manager) configureProxyDialer(d *ProxyDialer, needsProxy bool) {
 	if m.idleTracker != nil {
 		d.SetIdleTracker(m.idleTracker)
 	}
+
+	// The resolver is built per dialer because its query paths close over this
+	// dialer's routes.
+	resolver, err := m.buildResolver(d)
+	if err != nil {
+		// Rules are validated at startup, so reaching here means a route named
+		// by a rule is unavailable in this mode. Log and leave resolution off
+		// rather than failing every connection.
+		logger.Warn("DNS resolution disabled", "error", err)
+		return
+	}
+	if resolver != nil {
+		d.SetResolver(resolver)
+		logger.Info("DNS resolution enabled", "rules", len(m.cfg.DNSConfig.Rules))
+	}
+}
+
+// buildResolver creates the DNS resolver from config. Queries are dispatched
+// per rule over the route named by its via setting.
+func (m *Manager) buildResolver(d *ProxyDialer) (*dns.Resolver, error) {
+	if !m.cfg.DNSConfig.Enabled() {
+		return nil, nil
+	}
+
+	dialers := map[routing.Route]dns.DialFunc{
+		// via=proxy queries go straight to the backend rather than through
+		// ProxyDialer.Dial, which would apply routing rules to the DNS server
+		// address and could recurse back into resolution.
+		routing.RouteProxy: func(ctx context.Context, network, address string) (net.Conn, error) {
+			return d.dialProxy(ctx, network, address)
+		},
+		routing.RouteDirect: func(ctx context.Context, network, address string) (net.Conn, error) {
+			var nd net.Dialer
+			return nd.DialContext(ctx, network, address)
+		},
+	}
+
+	// vm-direct is only dialable once an agent connection exists.
+	if m.agentMux != nil {
+		dialers[routing.RouteVMDirect] = func(ctx context.Context, network, address string) (net.Conn, error) {
+			return d.dialViaAgent(ctx, network, address)
+		}
+	}
+
+	return dns.NewResolver(m.cfg.DNSConfig, dialers, m.clock)
 }
 
 func upstreamProxyURL(cfg *UpstreamProxyConfig) string {

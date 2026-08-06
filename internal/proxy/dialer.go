@@ -7,12 +7,21 @@ import (
 	"sync"
 	"time"
 
+	"github.com/wadahiro/awsocks/internal/dns"
 	"github.com/wadahiro/awsocks/internal/log"
 	"github.com/wadahiro/awsocks/internal/mux"
 	"github.com/wadahiro/awsocks/internal/routing"
 )
 
 var dialerLogger = log.For(log.ComponentProxy)
+
+// UpstreamProxyChecker is optionally implemented by backends that send some
+// destinations through an upstream HTTP proxy. Those destinations must keep
+// their hostname, because the upstream proxy resolves it and matches its own
+// patterns against the name.
+type UpstreamProxyChecker interface {
+	UsesUpstreamProxy(address string) bool
+}
 
 // ProxyDialer handles connection routing, lazy initialization, and fallback logic.
 // It is shared between SOCKS5 and HTTP CONNECT proxy servers.
@@ -24,6 +33,7 @@ type ProxyDialer struct {
 	agentMux        *mux.AgentMux
 	lazyInitializer LazyInitializer
 	idleTracker     *IdleTracker
+	resolver        *dns.Resolver
 }
 
 // NewProxyDialer creates a new ProxyDialer
@@ -42,6 +52,12 @@ func (d *ProxyDialer) SetLazyInitializer(initializer LazyInitializer) {
 // SetIdleTracker sets the idle tracker for activity monitoring
 func (d *ProxyDialer) SetIdleTracker(tracker *IdleTracker) {
 	d.idleTracker = tracker
+}
+
+// SetResolver sets the DNS resolver used to override hostname resolution.
+// A nil resolver leaves hostnames untouched.
+func (d *ProxyDialer) SetResolver(r *dns.Resolver) {
+	d.resolver = r
 }
 
 // SetBackend updates the backend after lazy initialization
@@ -102,11 +118,13 @@ func (d *ProxyDialer) Dial(ctx context.Context, network, addr string) (net.Conn,
 	}
 
 	// Apply hosts mapping after routing decision (so routing matches on original hostname)
+	hostsMapped := false
 	if d.router != nil {
 		resolved := d.router.ResolveHost(host)
 		if resolved != host {
 			dialerLogger.Info("Host resolved via hosts mapping", "original", host, "resolved", resolved)
 			host = resolved
+			hostsMapped = true
 			if port != "" {
 				addr = net.JoinHostPort(host, port)
 			} else {
@@ -117,19 +135,21 @@ func (d *ProxyDialer) Dial(ctx context.Context, network, addr string) (net.Conn,
 
 	// For direct route, connect directly (no need to wait for initialization)
 	if route == routing.RouteDirect {
+		dialAddr := d.resolveAddr(ctx, host, port, addr, hostsMapped)
 		var dialer net.Dialer
-		conn, err := dialer.DialContext(ctx, network, addr)
+		conn, err := dialer.DialContext(ctx, network, dialAddr)
 		if err != nil {
-			dialerLogger.Warn("Dial failed", "route", route, "address", addr, "error", err)
+			dialerLogger.Warn("Dial failed", "route", route, "address", dialAddr, "error", err)
 		}
 		return conn, err
 	}
 
 	// For vm-direct route, go through agent (no need to wait for proxy initialization)
 	if route == routing.RouteVMDirect {
-		conn, err := d.dialViaAgent(ctx, network, addr)
+		dialAddr := d.resolveAddr(ctx, host, port, addr, hostsMapped)
+		conn, err := d.dialViaAgent(ctx, network, dialAddr)
 		if err != nil {
-			dialerLogger.Warn("Dial failed", "route", route, "address", addr, "error", err)
+			dialerLogger.Warn("Dial failed", "route", route, "address", dialAddr, "error", err)
 		}
 		return conn, err
 	}
@@ -162,8 +182,20 @@ func (d *ProxyDialer) Dial(ctx context.Context, network, addr string) (net.Conn,
 		}
 	}
 
+	// Resolve only now that the backend is ready: a rule with via=proxy sends
+	// its query through this same backend, so resolving earlier would block on
+	// the initialization this call is already waiting for.
+	dialAddr := addr
+	resolved := false
+	if !d.skipDNSResolve(addr) {
+		if a := d.resolveAddr(ctx, host, port, addr, hostsMapped); a != addr {
+			dialAddr = a
+			resolved = true
+		}
+	}
+
 	// Try primary route (proxy)
-	conn, err := d.dialProxy(ctx, network, addr)
+	conn, err := d.dialProxy(ctx, network, dialAddr)
 	if err == nil {
 		if d.idleTracker != nil {
 			d.idleTracker.Touch()
@@ -173,8 +205,15 @@ func (d *ProxyDialer) Dial(ctx context.Context, network, addr string) (net.Conn,
 
 	// Check if fallback is needed
 	if !routing.IsFallbackableError(err) {
-		dialerLogger.Warn("Dial failed", "route", route, "address", addr, "error", err)
+		dialerLogger.Warn("Dial failed", "route", route, "address", dialAddr, "error", err)
 		return nil, err
+	}
+
+	// The resolved address turned out to be unreachable. Drop it so a changed
+	// address (failover, rescheduling) is picked up instead of being served
+	// from cache until the TTL expires.
+	if resolved {
+		d.resolver.Invalidate(host)
 	}
 
 	// Get fallback route
@@ -193,6 +232,42 @@ func (d *ProxyDialer) Dial(ctx context.Context, network, addr string) (net.Conn,
 		d.idleTracker.Touch()
 	}
 	return fallbackConn, fallbackErr
+}
+
+// resolveAddr returns the address to dial for host, applying the configured
+// DNS rules. It returns addr unchanged when no rule applies, when a static
+// hosts entry already decided the address, or when resolution failed under the
+// fallthrough policy.
+func (d *ProxyDialer) resolveAddr(ctx context.Context, host, port, addr string, hostsMapped bool) string {
+	// An explicit hosts entry is a stronger statement than a DNS answer,
+	// matching how /etc/hosts takes precedence over a resolver.
+	if hostsMapped || !d.resolver.Enabled() {
+		return addr
+	}
+
+	ip, ok, err := d.resolver.Resolve(ctx, host)
+	if err != nil {
+		// Only a rule with on-failure=fail produces an error here. Log it and
+		// keep the hostname; the dial that follows will surface the real
+		// failure with more context than an unresolvable name would.
+		dialerLogger.Warn("DNS resolution failed", "host", host, "error", err)
+		return addr
+	}
+	if !ok {
+		return addr
+	}
+
+	if port == "" {
+		return ip.String()
+	}
+	return net.JoinHostPort(ip.String(), port)
+}
+
+// skipDNSResolve reports whether the backend sends this address through an
+// upstream proxy, which needs the hostname rather than an address.
+func (d *ProxyDialer) skipDNSResolve(addr string) bool {
+	checker, ok := d.GetDialer().(UpstreamProxyChecker)
+	return ok && checker.UsesUpstreamProxy(addr)
 }
 
 // dialProxy dials using the proxy backend

@@ -38,6 +38,9 @@ type CLIFlags struct {
 	RouteDirect   []string
 	RouteVMDirect []string
 
+	// DNS settings
+	DNSServers []string
+
 	// SSH keepalive
 	SSHKeepalive      string
 	SSHKeepaliveIsSet bool
@@ -275,6 +278,7 @@ func mergeRoutingFromDefaults(src *RoutingConfig) *RoutingConfig {
 		Direct:             copySlice(src.Direct),
 		VMDirect:           copySlice(src.VMDirect),
 		Hosts:              copyMap(src.Hosts),
+		DNS:                copyDNSRules(src.DNS),
 		PreConnectDirect:   copySlice(src.PreConnectDirect),
 		PreConnectVMDirect: copySlice(src.PreConnectVMDirect),
 	}
@@ -288,12 +292,20 @@ func mergeRoutingFromProfile(base *RoutingConfig, profile *RoutingConfig) *Routi
 		Direct:             copySlice(base.Direct),
 		VMDirect:           copySlice(base.VMDirect),
 		Hosts:              copyMap(base.Hosts),
+		DNS:                copyDNSRules(base.DNS),
 		PreConnectDirect:   copySlice(base.PreConnectDirect),
 		PreConnectVMDirect: copySlice(base.PreConnectVMDirect),
 	}
 
 	if profile.Default != "" {
 		result.Default = profile.Default
+	}
+
+	// DNS rules are replaced rather than appended: the list is an ordered
+	// decision table, so appending would let a catch-all rule from defaults
+	// shadow the profile's more specific rules.
+	if len(profile.DNS) > 0 {
+		result.DNS = copyDNSRules(profile.DNS)
 	}
 
 	// Merge arrays (profile patterns added to existing)
@@ -317,6 +329,7 @@ func mergeRoutingFromCLI(base *RoutingConfig, cli *CLIFlags) *RoutingConfig {
 		Direct:             copySlice(base.Direct),
 		VMDirect:           copySlice(base.VMDirect),
 		Hosts:              copyMap(base.Hosts),
+		DNS:                copyDNSRules(base.DNS),
 		PreConnectDirect:   copySlice(base.PreConnectDirect),
 		PreConnectVMDirect: copySlice(base.PreConnectVMDirect),
 	}
@@ -330,6 +343,32 @@ func mergeRoutingFromCLI(base *RoutingConfig, cli *CLIFlags) *RoutingConfig {
 	result.Direct = mergeStringSlices(result.Direct, cli.RouteDirect)
 	result.VMDirect = mergeStringSlices(result.VMDirect, cli.RouteVMDirect)
 
+	// --dns-server overrides the servers of every configured rule, or creates
+	// a single catch-all rule when no rules are configured.
+	if len(cli.DNSServers) > 0 {
+		if len(result.DNS) == 0 {
+			result.DNS = []DNSRule{{Servers: copySlice(cli.DNSServers)}}
+		} else {
+			for i := range result.DNS {
+				result.DNS[i].Servers = copySlice(cli.DNSServers)
+			}
+		}
+	}
+
+	return result
+}
+
+// copyDNSRules deep-copies DNS rules.
+func copyDNSRules(src []DNSRule) []DNSRule {
+	if src == nil {
+		return nil
+	}
+	result := make([]DNSRule, len(src))
+	for i, r := range src {
+		result[i] = r
+		result[i].Servers = copySlice(r.Servers)
+		result[i].Patterns = copySlice(r.Patterns)
+	}
 	return result
 }
 

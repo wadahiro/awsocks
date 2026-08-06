@@ -148,6 +148,61 @@ When using SOCKS5h (remote DNS resolution), the EC2 instance may not be able to 
 
 Routing decisions are made using the original hostname, then the resolved IP is used for the actual connection.
 
+#### DNS Resolution
+
+By default, hostnames are resolved by whichever host handles the connection: the EC2 instance for `proxy` routes, the local machine for `direct`, and the VM for `vm-direct`. When that resolver cannot see the names you need — a private hosted zone the EC2 instance is not configured for, or an internal DNS server only reachable through the tunnel — `dns` rules point specific hostnames at specific DNS servers:
+
+```toml
+[[defaults.routing.dns]]
+servers = ["10.0.0.2:53"]
+patterns = ["*.internal.example.com"]
+```
+
+Rules are evaluated in order and the first one matching a hostname wins. Queries use DNS over TCP.
+
+The `via` setting selects the route that carries the DNS query itself, independent of the route used to reach the resolved address:
+
+```toml
+# Query a VPC resolver through the SSM tunnel (default)
+[[defaults.routing.dns]]
+via = "proxy"
+servers = ["10.0.0.2:53"]
+patterns = ["*.internal.example.com"]
+
+# Query a DNS server reachable from this machine, e.g. over a VPN
+[[defaults.routing.dns]]
+via = "direct"
+servers = ["192.168.1.1:53"]
+patterns = ["*.corp.example.com"]
+
+# Query through the VM's NAT (VM mode only)
+[[defaults.routing.dns]]
+via = "vm-direct"
+servers = ["10.0.0.2:53"]
+patterns = ["*.vm.example.com"]
+```
+
+Every combination of `via` and connect route is allowed, because only your network topology determines which is correct. Resolving a name through the tunnel and then connecting to it directly is a valid setup when the address is reachable from this machine.
+
+| Setting | Default | Description |
+|---------|---------|-------------|
+| `via` | `proxy` | Route carrying the DNS query (`proxy`, `direct`, `vm-direct`) |
+| `servers` | (required) | DNS servers as `IP` or `IP:port`, tried in order. Must be IP addresses |
+| `patterns` | (all hosts) | Hostname patterns this rule applies to |
+| `timeout` | `3s` | Per-server query timeout |
+| `min-ttl` | `10s` | Lower clamp on response TTL |
+| `max-ttl` | `5m` | Upper clamp on response TTL |
+| `negative-ttl` | `5s` | How long NXDOMAIN is cached |
+| `on-failure` | `fallthrough` | `fallthrough` passes the hostname on unchanged; `fail` returns an error |
+| `prefer` | `ipv4` | Address family preference (`ipv4` or `ipv6`) |
+
+Notes:
+
+- A `hosts` entry takes precedence over these rules, the way `/etc/hosts` takes precedence over a resolver.
+- Destinations sent through an `upstream-proxy` keep their hostname, since the upstream proxy resolves them itself.
+- When a `proxy` connection fails and falls back to another route, the fallback uses the original hostname rather than the resolved address, and the cached entry is dropped so the next attempt re-queries.
+- Profile rules replace the rules from `defaults` rather than adding to them, since the list is an ordered decision table.
+
 ## CLI Reference
 
 ```bash
@@ -170,6 +225,7 @@ awsocks start [profile] [flags]
 | `--route-default` | Default route (proxy/direct) |
 | `--route-proxy` | Patterns to route via proxy |
 | `--route-direct` | Patterns to route directly |
+| `--dns-server` | DNS server IP for hostname resolution |
 | `--lazy` | Enable lazy connection mode |
 | `--proxy-network` | Proxy network (direct/vm) |
 | `--idle-timeout` | Suspend EC2 after idle period |

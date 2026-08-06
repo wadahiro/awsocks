@@ -23,6 +23,7 @@ internal/
   clock/         # Time abstraction for testing
   config/        # TOML config, CLI flags, merge logic
   credentials/   # AWS credential provider with auto-refresh
+  dns/           # DNS-over-TCP resolver with per-route query dispatch
   ec2/           # Instance resolver (Name tag search)
   log/           # Structured logging
   mux/           # AgentMux: shared vsock multiplexer (host <-> VM agent)
@@ -67,6 +68,23 @@ Routes determine how connections are handled:
 - `block` - Block connection
 
 Fallback: When `proxy` fails with "No route to host", automatically retries via `direct` or `vm-direct`.
+
+## DNS Resolution
+
+`[[routing.dns]]` rules resolve hostnames against specific DNS servers instead of
+the route's own resolver. Each rule's `via` selects the route carrying the query
+(`proxy`, `direct`, `vm-direct`), independent of the connect route — all
+combinations are valid since only the topology determines what is reachable.
+
+Order in `ProxyDialer.Dial`: route decision (original hostname) → `hosts` map →
+DNS rules → connect. Key invariants:
+
+- `hosts` entries win over DNS rules
+- `upstream-proxy` destinations keep their hostname
+- Fallback dials the hostname, never the resolved IP (a VPC address dialed from
+  the host's LAN could reach an unrelated machine), and invalidates the cache
+- `via=proxy` resolution happens after lazy init completes, or the query would
+  block on the initialization it is nested inside
 
 ## Lazy Connection Mode
 

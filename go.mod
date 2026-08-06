@@ -21,6 +21,7 @@ require (
 	github.com/xtaci/smux v1.5.35
 	golang.org/x/crypto v0.47.0
 	golang.org/x/net v0.48.0
+	golang.org/x/sync v0.18.0
 )
 
 require (
@@ -46,7 +47,6 @@ require (
 	github.com/vishvananda/netns v0.0.5 // indirect
 	github.com/xrash/smetrics v0.0.0-20240521201337-686a1a2994c1 // indirect
 	golang.org/x/mod v0.22.0 // indirect
-	golang.org/x/sync v0.18.0 // indirect
 	golang.org/x/sys v0.40.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 )

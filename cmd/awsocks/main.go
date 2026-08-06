@@ -13,6 +13,7 @@ import (
 
 	"github.com/urfave/cli/v2"
 	appconfig "github.com/wadahiro/awsocks/internal/config"
+	"github.com/wadahiro/awsocks/internal/dns"
 	"github.com/wadahiro/awsocks/internal/log"
 	"github.com/wadahiro/awsocks/internal/proxy"
 	"github.com/wadahiro/awsocks/internal/routing"
@@ -152,6 +153,10 @@ func main() {
 						Name:  "route-vm-direct",
 						Usage: "Patterns to route via VM NAT (can be specified multiple times)",
 					},
+					&cli.StringSliceFlag{
+						Name:  "dns-server",
+						Usage: "DNS server IP for hostname resolution (can be specified multiple times)",
+					},
 					&cli.StringFlag{
 						Name:  "ssh-keepalive",
 						Usage: "SSH keepalive interval (e.g., \"30s\", \"0\" to disable)",
@@ -240,6 +245,13 @@ func startAction(c *cli.Context) error {
 	// Build routing config
 	routingCfg := buildRoutingConfig(merged.Routing)
 
+	// Validate DNS rules up front so a bad rule fails at startup rather than
+	// on the first connection that would have used it.
+	dnsCfg, err := buildDNSConfig(merged.Routing)
+	if err != nil {
+		return err
+	}
+
 	// Build proxy config
 	cfg := &proxy.Config{
 		InstanceID:           merged.InstanceID,
@@ -257,6 +269,7 @@ func startAction(c *cli.Context) error {
 		AutoStart:            merged.AutoStart,
 		AutoStop:             merged.AutoStop,
 		RoutingConfig:        routingCfg,
+		DNSConfig:            dnsCfg,
 		LazyConnect:          merged.Lazy,
 		IdleTimeout:          merged.IdleTimeout,
 		SSHKeepaliveInterval: merged.SSHKeepaliveInterval,
@@ -416,6 +429,9 @@ func buildCLIFlags(c *cli.Context) *appconfig.CLIFlags {
 	if c.IsSet("route-vm-direct") {
 		cli.RouteVMDirect = c.StringSlice("route-vm-direct")
 	}
+	if c.IsSet("dns-server") {
+		cli.DNSServers = c.StringSlice("dns-server")
+	}
 	if c.IsSet("ssh-keepalive") {
 		cli.SSHKeepalive = c.String("ssh-keepalive")
 		cli.SSHKeepaliveIsSet = true
@@ -444,6 +460,31 @@ func buildRoutingConfig(cfg *appconfig.RoutingConfig) *routing.Config {
 		PreConnectDirect:   cfg.PreConnectDirect,
 		PreConnectVMDirect: cfg.PreConnectVMDirect,
 	}
+}
+
+// buildDNSConfig converts the merged DNS rules into runtime form.
+// Returns nil when no rules are configured.
+func buildDNSConfig(cfg *appconfig.RoutingConfig) (*dns.Config, error) {
+	if cfg == nil || len(cfg.DNS) == 0 {
+		return nil, nil
+	}
+
+	specs := make([]dns.RuleSpec, 0, len(cfg.DNS))
+	for _, r := range cfg.DNS {
+		specs = append(specs, dns.RuleSpec{
+			Via:         r.Via,
+			Servers:     r.Servers,
+			Patterns:    r.Patterns,
+			Timeout:     r.Timeout,
+			MinTTL:      r.MinTTL,
+			MaxTTL:      r.MaxTTL,
+			NegativeTTL: r.NegativeTTL,
+			OnFailure:   r.OnFailure,
+			Prefer:      r.Prefer,
+		})
+	}
+
+	return dns.BuildConfig(specs)
 }
 
 func convertUpstreamProxy(cfg *appconfig.UpstreamProxyConfig) *proxy.UpstreamProxyConfig {

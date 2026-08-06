@@ -136,6 +136,13 @@ func New(cfg *Config, ssmClient SSMClient) *Backend {
 	return b
 }
 
+// UsesUpstreamProxy reports whether the address is routed through the upstream
+// proxy. Callers use it to keep such destinations as hostnames, since the
+// upstream proxy resolves them and matches its patterns against the name.
+func (b *Backend) UsesUpstreamProxy(address string) bool {
+	return b.shouldUseUpstreamProxy(address)
+}
+
 // shouldUseUpstreamProxy checks if the address should be routed through the upstream proxy.
 // Returns true if upstream proxy is configured and the host matches any of the patterns.
 // If no patterns are configured, all connections go through the upstream proxy.
