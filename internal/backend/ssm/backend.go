@@ -706,6 +706,15 @@ func (b *Backend) connectSSH(dc *datachannel.DataChannel) error {
 			b.logDebug("SSH handshake attempt %d failed: %v, retrying...", attempt, lastErr)
 			time.Sleep(sshRetryInterval)
 
+			// Re-check after the sleep: a disconnect landing during it would
+			// otherwise install a fresh bridge nobody services (handleDisconnect
+			// already ran and won't fire again), stalling this attempt for the
+			// full sshHandshakeTimeout on a pipe that can never receive data.
+			if !dc.IsOpen() {
+				b.clearBridge()
+				return fmt.Errorf("DataChannel closed during SSH handshake")
+			}
+
 			// Recreate the bridge for retry since SSH handshake corrupts the
 			// connection. installBridge closes the previous bridge (stopping its
 			// transfer goroutine) before installing the new one, so no zombie

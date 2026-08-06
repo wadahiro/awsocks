@@ -249,3 +249,75 @@ func TestBackend_ParallelDials(t *testing.T) {
 	assert.Equal(t, numParallel, successCount, "not all parallel dials succeeded")
 	t.Logf("Successfully completed %d parallel dials", successCount)
 }
+
+// TestBackend_SSHFailure_TerminatesSSMSession is a regression test for leaked
+// SSM sessions: when a connection attempt creates an SSM session but SSH
+// handshake never completes (e.g. the DataChannel is torn down mid-handshake,
+// as observed with AWS SSM agent closing with code=1000 reason="Bye"), the
+// abandoned session must be terminated so it cannot linger and contend with
+// the next retry's session on the AWS/SSM-agent side.
+func TestBackend_SSHFailure_TerminatesSSMSession(t *testing.T) {
+	// No SSH server behind the fake SSM server: it falls back to echo mode,
+	// so SSH handshake bytes are echoed back verbatim instead of a real SSH
+	// reply, making each ssh.NewClientConn attempt fail fast. The session is
+	// then closed mid-handshake (below) to trigger the DataChannel-closed path.
+	ssmServer := fakessm.NewServer(&fakessm.ServerOptions{AgentVersion: "3.1.0.0"})
+	ssmServer.Start()
+	defer ssmServer.Close()
+
+	backend := ssm.New(&ssm.Config{
+		InstanceID: "i-test-instance",
+		Region:     "us-east-1",
+		SSHUser:    "testuser",
+	}, ssmServer)
+
+	sshServer, err := fakessm.NewSSHServer()
+	require.NoError(t, err)
+	err = backend.SetSSHKeyContent(sshServer.PrivateKey(), "")
+	require.NoError(t, err)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	err = backend.Start(ctx)
+	require.NoError(t, err)
+	defer backend.Close()
+
+	err = backend.OnCredentialUpdate(aws.Credentials{
+		AccessKeyID:     "AKIATEST",
+		SecretAccessKey: "testsecret",
+		SessionToken:    "testtoken",
+	})
+	require.NoError(t, err)
+
+	// Close the DataChannel session mid SSH-handshake, reproducing the
+	// AWS SSM agent sending code=1000 reason="Bye" while connectSSH is
+	// running: tryConnect's SSH-failure cleanup path is what's under test,
+	// not the full 12-attempt outer retry loop (which would make this test
+	// take minutes).
+	dialCtx, dialCancel := context.WithCancel(ctx)
+	defer dialCancel()
+	go func() {
+		require.Eventually(t, func() bool {
+			return ssmServer.SessionCount() >= 1
+		}, 10*time.Second, 20*time.Millisecond, "SSM session was never created")
+		time.Sleep(200 * time.Millisecond) // let SSH handshake begin before cutting the DataChannel
+		for _, session := range ssmServer.Sessions() {
+			session.Close()
+		}
+
+		// The outer connect() loop would otherwise retry for up to 12*10s;
+		// cancel Dial as soon as tryConnect's cleanup path (under test) runs,
+		// rather than waiting for that full retry budget.
+		deadline := time.Now().Add(5 * time.Second)
+		for len(ssmServer.TerminatedSessionIDs()) == 0 && time.Now().Before(deadline) {
+			time.Sleep(50 * time.Millisecond)
+		}
+		dialCancel()
+	}()
+
+	_, err = backend.Dial(dialCtx, "tcp", "example.com:80")
+	require.Error(t, err, "dial should fail: SSM session was closed mid SSH-handshake")
+
+	assert.Equal(t, 1, len(ssmServer.TerminatedSessionIDs()))
+}

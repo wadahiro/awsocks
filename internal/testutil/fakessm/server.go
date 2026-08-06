@@ -43,11 +43,12 @@ func DefaultServerOptions() *ServerOptions {
 
 // Server is a fake SSM server for testing
 type Server struct {
-	httpServer *httptest.Server
-	sessions   map[string]*Session
-	mu         sync.RWMutex
-	opts       *ServerOptions
-	upgrader   websocket.Upgrader
+	httpServer           *httptest.Server
+	sessions             map[string]*Session
+	mu                   sync.RWMutex
+	opts                 *ServerOptions
+	upgrader             websocket.Upgrader
+	terminatedSessionIDs []string
 }
 
 // NewServer creates a new fake SSM server
@@ -215,9 +216,21 @@ func (s *Server) StartSession(ctx context.Context, input *ssmbackend.StartSessio
 
 // TerminateSession implements the SSMClient interface for testing.
 func (s *Server) TerminateSession(ctx context.Context, input *ssmbackend.TerminateSessionInput) (*ssmbackend.TerminateSessionOutput, error) {
+	s.mu.Lock()
+	s.terminatedSessionIDs = append(s.terminatedSessionIDs, input.SessionId)
+	s.mu.Unlock()
 	return &ssmbackend.TerminateSessionOutput{
 		SessionId: input.SessionId,
 	}, nil
+}
+
+// TerminatedSessionIDs returns the session IDs passed to TerminateSession, in call order.
+func (s *Server) TerminatedSessionIDs() []string {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]string, len(s.terminatedSessionIDs))
+	copy(result, s.terminatedSessionIDs)
+	return result
 }
 
 // DescribeInstanceInformation implements the SSMClient interface for testing.
