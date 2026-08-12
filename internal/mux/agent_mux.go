@@ -205,16 +205,18 @@ func (m *AgentMux) handleData(msg *protocol.Message) {
 	dataCopy := make([]byte, len(msg.Payload))
 	copy(dataCopy, msg.Payload)
 
-	conn.mu.Lock()
-	closed := conn.closed
-	conn.mu.Unlock()
-
-	if !closed {
-		select {
-		case conn.readBuf <- dataCopy:
-		default:
-			logger.Warn("Read buffer full for connection", "connID", msg.ConnID)
-		}
+	// Block until the conn's reader drains readBuf, rather than dropping the
+	// frame when it's full: a dropped frame silently corrupts that conn's
+	// byte stream (TCP semantics require every byte delivered in order),
+	// stalling it until callers notice via a timeout. This does mean a slow
+	// reader on one conn applies backpressure to the shared read loop, so it
+	// can delay delivery to other conns - accepted since correctness matters
+	// more than throughput here.
+	select {
+	case conn.readBuf <- dataCopy:
+	case <-conn.closeSignal():
+		// Conn closed locally or by the agent while we waited; drop quietly.
+	case <-m.ctx.Done():
 	}
 }
 
@@ -284,6 +286,7 @@ type MuxConn struct {
 	readBuf   chan []byte
 	remaining []byte
 	closed    bool
+	done      chan struct{} // closed once, alongside closed=true, to unblock handleData's send
 	mu        sync.Mutex
 	closeOnce sync.Once
 }
@@ -293,7 +296,14 @@ func newMuxConn(id uint32, mux *AgentMux) *MuxConn {
 		id:      id,
 		mux:     mux,
 		readBuf: make(chan []byte, 256),
+		done:    make(chan struct{}),
 	}
+}
+
+// closeSignal returns a channel closed once this conn is closed (locally or
+// by the agent), letting handleData stop waiting to deliver into readBuf.
+func (c *MuxConn) closeSignal() <-chan struct{} {
+	return c.done
 }
 
 func (c *MuxConn) Read(b []byte) (int, error) {
@@ -304,24 +314,27 @@ func (c *MuxConn) Read(b []byte) (int, error) {
 		return n, nil
 	}
 
-	c.mu.Lock()
-	closed := c.closed
-	c.mu.Unlock()
-
-	if closed {
-		return 0, io.EOF
-	}
-
+	// Drain any data still buffered before honoring a close, so a local or
+	// remote Close doesn't discard bytes that arrived just before it.
 	select {
-	case data, ok := <-c.readBuf:
-		if !ok {
-			return 0, io.EOF
-		}
+	case data := <-c.readBuf:
 		n := copy(b, data)
 		if n < len(data) {
 			c.remaining = data[n:]
 		}
 		return n, nil
+	default:
+	}
+
+	select {
+	case data := <-c.readBuf:
+		n := copy(b, data)
+		if n < len(data) {
+			c.remaining = data[n:]
+		}
+		return n, nil
+	case <-c.done:
+		return 0, io.EOF
 	case <-time.After(time.Minute):
 		return 0, fmt.Errorf("read timeout")
 	}
@@ -347,8 +360,8 @@ func (c *MuxConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed = true
-		close(c.readBuf)
 		c.mu.Unlock()
+		close(c.done)
 
 		c.mux.unregisterConn(c.id)
 
@@ -363,8 +376,8 @@ func (c *MuxConn) closeFromRemote() {
 	c.closeOnce.Do(func() {
 		c.mu.Lock()
 		c.closed = true
-		close(c.readBuf)
 		c.mu.Unlock()
+		close(c.done)
 
 		c.mux.unregisterConn(c.id)
 	})

@@ -485,6 +485,77 @@ func TestAgentMux_SimulateSOCKS5AndAWSAPI(t *testing.T) {
 	require.NoError(t, <-awsapiDone, "AWS API goroutine should succeed")
 }
 
+// TestAgentMux_DataDelivery_NoDropWhenBufferFull is a regression test for
+// silent data loss: handleData used to drop a frame with only a Warn log
+// when a conn's readBuf (256 slots) was full, permanently corrupting that
+// stream's byte sequence while every other conn kept working. Sending more
+// than the buffer size before the client reads any of it must not lose data.
+func TestAgentMux_DataDelivery_NoDropWhenBufferFull(t *testing.T) {
+	agentSide, muxSide := net.Pipe()
+	defer agentSide.Close()
+	defer muxSide.Close()
+
+	mux := NewAgentMux(muxSide)
+	defer mux.Close()
+
+	connIDCh := make(chan uint32, 1)
+	go func() {
+		for {
+			msg, err := protocol.ReadMessage(agentSide)
+			if err != nil {
+				return
+			}
+			if msg.Type == protocol.MsgConnectDirect {
+				ack := &protocol.Message{Type: protocol.MsgConnectAck, ConnID: msg.ConnID}
+				if err := protocol.WriteMessage(agentSide, ack); err != nil {
+					return
+				}
+				connIDCh <- msg.ConnID
+			}
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := mux.Dial(ctx, "tcp", "example.com:443")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	connID := <-connIDCh
+
+	// Send more data messages than readBuf's capacity (256) with nobody
+	// reading yet, so the send loop must fill (and block on) the buffer
+	// before the client below starts draining it.
+	const numMsgs = 300
+	sendDone := make(chan struct{})
+	go func() {
+		defer close(sendDone)
+		for i := 0; i < numMsgs; i++ {
+			data := []byte(fmt.Sprintf("msg-%03d", i))
+			dataMsg := protocol.NewDataMessage(connID, data)
+			if err := protocol.WriteMessage(agentSide, dataMsg); err != nil {
+				return
+			}
+		}
+	}()
+
+	// Give the send loop time to fill readBuf and block on the 257th+ message
+	// (handleData's old behavior: drop it silently instead of blocking).
+	time.Sleep(200 * time.Millisecond)
+
+	for i := 0; i < numMsgs; i++ {
+		expected := fmt.Sprintf("msg-%03d", i)
+		buf := make([]byte, len(expected))
+		conn.SetReadDeadline(time.Now().Add(10 * time.Second))
+		_, err := io.ReadFull(conn, buf)
+		require.NoError(t, err, "reading message %d", i)
+		assert.Equal(t, expected, string(buf), "message %d corrupted or lost", i)
+	}
+
+	<-sendDone
+}
+
 func TestAgentMux_SendShutdown(t *testing.T) {
 	agentSide, muxSide := net.Pipe()
 	defer agentSide.Close()
