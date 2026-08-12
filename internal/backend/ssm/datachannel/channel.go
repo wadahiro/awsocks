@@ -124,7 +124,39 @@ func (d *DataChannel) Open(ctx context.Context, url string) error {
 	// Start resend scheduler
 	d.startResendScheduler()
 
+	// Start periodic queue-depth dump (diagnostic aid for hangs: distinguishes
+	// "sending into a void" (pending growing) from "nothing to send" (pending
+	// stays 0, stall is above this layer)).
+	d.startQueueDepthDumper()
+
 	return nil
+}
+
+// startQueueDepthDumper periodically logs how many messages are awaiting ACK
+// and how many are queued for resend, independent of message traffic (a
+// timer tick fires even during a total stall, unlike per-message logging).
+func (d *DataChannel) startQueueDepthDumper() {
+	go func() {
+		ticker := time.NewTicker(10 * time.Second)
+		defer ticker.Stop()
+
+		for {
+			select {
+			case <-d.ctx.Done():
+				return
+			case <-ticker.C:
+				d.mu.RLock()
+				pending := len(d.pendingMessages)
+				d.mu.RUnlock()
+
+				d.outgoingMu.Lock()
+				buffered := d.outgoingBuffer.Len()
+				d.outgoingMu.Unlock()
+
+				dcLogger.Info("Queue depth", "pendingAck", pending, "outgoingBuffered", buffered)
+			}
+		}
+	}()
 }
 
 // Close closes the data channel

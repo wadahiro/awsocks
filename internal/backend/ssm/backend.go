@@ -114,6 +114,8 @@ type Backend struct {
 
 	// Connection tracking
 	openChannels int64
+	nextConnID   int64
+	activeConns  sync.Map // *trackedConn -> struct{}, for periodic per-destination throughput dumps
 
 	ctx    context.Context
 	cancel context.CancelFunc
@@ -235,7 +237,61 @@ func (b *Backend) Start(ctx context.Context) error {
 		b.sshConfig = sshConfig
 	}
 
+	go b.runThroughputDumper(b.ctx)
+
 	return nil
+}
+
+// runThroughputDumper periodically logs per-destination byte counters for all
+// currently open connections, so a hang shows up as a same-second snapshot
+// (which destinations are moving bytes, which are stalled) instead of only
+// being visible after Close() finally happens.
+func (b *Backend) runThroughputDumper(ctx context.Context) {
+	ticker := time.NewTicker(10 * time.Second)
+	defer ticker.Stop()
+
+	type snapshot struct {
+		up, down int64
+	}
+	last := make(map[*trackedConn]snapshot)
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			b.activeConns.Range(func(key, _ any) bool {
+				c := key.(*trackedConn)
+				up := atomic.LoadInt64(&c.bytesUp)
+				down := atomic.LoadInt64(&c.bytesDown)
+				prev := last[c]
+				upDelta := up - prev.up
+				downDelta := down - prev.down
+				last[c] = snapshot{up: up, down: down}
+
+				// Skip connections that have moved zero bytes in either
+				// direction so far, to keep this readable at --log-level info
+				// during long runs. Once a connection has sent or received
+				// anything, keep logging it every tick even at delta==0 --
+				// "upTotal>0 but downDelta stayed 0 while age keeps growing"
+				// is exactly the stalled-response signature the hang
+				// decision table looks for.
+				if up == 0 && down == 0 {
+					return true
+				}
+
+				logger.Info("Throughput",
+					"connID", c.id,
+					"address", c.address,
+					"upTotal", up,
+					"downTotal", down,
+					"upDelta", upDelta,
+					"downDelta", downDelta,
+					"age", time.Since(c.dialedAt).Round(time.Second))
+				return true
+			})
+		}
+	}
 }
 
 // Dial establishes a connection to the target address via SSH direct-tcpip channel
@@ -317,8 +373,11 @@ func (b *Backend) Dial(ctx context.Context, network, address string) (net.Conn, 
 			return nil, fmt.Errorf("SSH dial failed: %w", result.err)
 		}
 		channels := atomic.AddInt64(&b.openChannels, 1)
-		b.logDebug("Dial success address=%s openChannels=%d", address, channels)
-		return &trackedConn{Conn: result.conn, backend: b, address: address}, nil
+		connID := atomic.AddInt64(&b.nextConnID, 1)
+		b.logDebug("Dial success address=%s openChannels=%d connID=%d", address, channels, connID)
+		tc := &trackedConn{Conn: result.conn, backend: b, id: connID, address: address, dialedAt: time.Now()}
+		b.activeConns.Store(tc, struct{}{})
+		return tc, nil
 	}
 }
 
@@ -927,6 +986,14 @@ func (b *Backend) cleanup() {
 		b.dataChannel = nil
 		dc.Close()
 	}
+
+	// Individual trackedConn.Close() calls may not run before the SSH client
+	// itself is torn down above, so drop any stragglers here to avoid the
+	// throughput dumper holding stale entries forever.
+	b.activeConns.Range(func(key, _ any) bool {
+		b.activeConns.Delete(key)
+		return true
+	})
 }
 
 // Close releases all resources
@@ -977,17 +1044,48 @@ func (b *Backend) SetSSHKeyContent(keyContent []byte, passphrase string) error {
 // trackedConn wraps a net.Conn to track when it's closed
 type trackedConn struct {
 	net.Conn
-	backend   *Backend
-	address   string
-	closed    bool
-	closeOnce sync.Once
+	backend       *Backend
+	id            int64 // joins this conn's Dial success / Throughput / Connection closed log lines
+	address       string
+	closed        bool
+	closeOnce     sync.Once
+	dialedAt      time.Time
+	bytesUp       int64
+	bytesDown     int64
+	firstReadOnce sync.Once
+}
+
+func (c *trackedConn) Read(p []byte) (int, error) {
+	n, err := c.Conn.Read(p)
+	if n > 0 {
+		atomic.AddInt64(&c.bytesDown, int64(n))
+		c.firstReadOnce.Do(func() {
+			logger.Debug("First response byte", "connID", c.id, "address", c.address, "ttfb", time.Since(c.dialedAt))
+		})
+	}
+	return n, err
+}
+
+func (c *trackedConn) Write(p []byte) (int, error) {
+	n, err := c.Conn.Write(p)
+	if n > 0 {
+		atomic.AddInt64(&c.bytesUp, int64(n))
+	}
+	return n, err
 }
 
 func (c *trackedConn) Close() error {
 	c.closeOnce.Do(func() {
 		c.closed = true
+		c.backend.activeConns.Delete(c)
 		channels := atomic.AddInt64(&c.backend.openChannels, -1)
-		logger.Debug("Connection closed", "address", c.address, "openChannels", channels)
+		logger.Info("Connection closed",
+			"connID", c.id,
+			"address", c.address,
+			"openChannels", channels,
+			"bytesUp", atomic.LoadInt64(&c.bytesUp),
+			"bytesDown", atomic.LoadInt64(&c.bytesDown),
+			"duration", time.Since(c.dialedAt))
 	})
 	return c.Conn.Close()
 }
