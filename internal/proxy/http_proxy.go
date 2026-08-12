@@ -171,8 +171,22 @@ func (s *HTTPProxyServer) handleForward(conn net.Conn, req *http.Request) {
 		return
 	}
 
-	// Copy the response back
-	io.Copy(conn, targetConn)
+	// Copy the response back. Watch the client side too, so an ESC/abort on
+	// the client promptly closes targetConn instead of leaking the SSH
+	// channel until the (possibly stalled) upstream sends a byte.
+	done := make(chan struct{}, 2)
+
+	go func() {
+		io.Copy(conn, targetConn)
+		done <- struct{}{}
+	}()
+
+	go func() {
+		io.Copy(io.Discard, conn)
+		done <- struct{}{}
+	}()
+
+	<-done
 }
 
 // removeHopByHopHeaders removes headers that should not be forwarded

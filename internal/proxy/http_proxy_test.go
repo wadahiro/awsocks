@@ -140,6 +140,65 @@ func TestHTTPProxyServer_ForwardGET(t *testing.T) {
 	server.Stop()
 }
 
+func TestHTTPProxyServer_ForwardGET_ClientDisconnectClosesTarget(t *testing.T) {
+	// Target accepts the request but never responds, simulating an upstream
+	// that is hung/slow, and reports whether/when its connection was closed.
+	targetListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer targetListener.Close()
+
+	targetClosed := make(chan struct{})
+	go func() {
+		conn, err := targetListener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		br := bufio.NewReader(conn)
+		if _, err := http.ReadRequest(br); err != nil {
+			return
+		}
+		// Never write a response. Detect the proxy closing its side by
+		// observing a read error/EOF on our end.
+		buf := make([]byte, 1)
+		conn.Read(buf)
+		close(targetClosed)
+	}()
+	targetAddr := targetListener.Addr().String()
+
+	router := &mockRouter{route: routing.RouteDirect}
+	cfg := &Config{
+		HTTPListenAddr: "127.0.0.1:0",
+	}
+	server := NewHTTPProxyServer(cfg, router, nil)
+
+	go server.Start()
+	time.Sleep(100 * time.Millisecond)
+
+	server.listenerMu.Lock()
+	listener := server.listener
+	server.listenerMu.Unlock()
+	require.NotNil(t, listener)
+	proxyAddr := listener.Addr().String()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, time.Second)
+	require.NoError(t, err)
+
+	fmt.Fprintf(conn, "GET http://%s/api/data HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddr, targetAddr)
+
+	// The client aborts (e.g. ESC) before the target ever answers.
+	conn.Close()
+
+	select {
+	case <-targetClosed:
+		// expected: client disconnect propagates to the target connection
+	case <-time.After(2 * time.Second):
+		t.Fatal("target connection was not closed after client disconnected")
+	}
+
+	server.Stop()
+}
+
 func TestHTTPProxyServer_CONNECT_BadAddress(t *testing.T) {
 	router := &mockRouter{route: routing.RouteDirect}
 	cfg := &Config{
