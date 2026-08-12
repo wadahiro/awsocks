@@ -19,6 +19,14 @@ import (
 
 var logger = log.For(log.ComponentProxy)
 
+// Default health-check cadence: frequent enough to catch a wedged vsock
+// conn (open but silently dropping traffic) well before the per-conn
+// 1-minute read timeout, without adding meaningful protocol chatter.
+const (
+	defaultPingInterval = 15 * time.Second
+	defaultPongTimeout  = 20 * time.Second
+)
+
 // Option configures AgentMux behavior.
 type Option func(*AgentMux)
 
@@ -29,19 +37,34 @@ func WithLogHandler(fn func(payload *protocol.LogPayload)) Option {
 	}
 }
 
+// withPingInterval overrides the ping cadence. Test-only (unexported): the
+// default is deliberately not user-configurable.
+func withPingInterval(d time.Duration) Option {
+	return func(m *AgentMux) { m.pingInterval = d }
+}
+
+// withPongTimeout overrides how long a Ping may go unanswered before the mux
+// is declared dead. Test-only (unexported).
+func withPongTimeout(d time.Duration) Option {
+	return func(m *AgentMux) { m.pongTimeout = d }
+}
+
 // AgentMux multiplexes multiple logical connections over a single agent connection.
 // It is the sole owner of the underlying net.Conn and runs a single read loop.
 type AgentMux struct {
-	conn       net.Conn
-	writeMu    sync.Mutex
-	nextConnID uint32
-	pending    map[uint32]chan connResult
-	pendingMu  sync.Mutex
-	conns      map[uint32]*MuxConn
-	connsMu    sync.RWMutex
-	onLog      func(payload *protocol.LogPayload)
-	ctx        context.Context
-	cancel     context.CancelFunc
+	conn         net.Conn
+	writeMu      sync.Mutex
+	nextConnID   uint32
+	pending      map[uint32]chan connResult
+	pendingMu    sync.Mutex
+	conns        map[uint32]*MuxConn
+	connsMu      sync.RWMutex
+	onLog        func(payload *protocol.LogPayload)
+	pingInterval time.Duration
+	pongTimeout  time.Duration
+	pongCh       chan struct{}
+	ctx          context.Context
+	cancel       context.CancelFunc
 }
 
 // connResult holds the result of a Dial attempt.
@@ -51,20 +74,24 @@ type connResult struct {
 }
 
 // NewAgentMux creates a new multiplexer that owns the given connection.
-// It immediately starts the read loop goroutine.
+// It immediately starts the read loop and ping health-check goroutines.
 func NewAgentMux(conn net.Conn, opts ...Option) *AgentMux {
 	ctx, cancel := context.WithCancel(context.Background())
 	m := &AgentMux{
-		conn:    conn,
-		pending: make(map[uint32]chan connResult),
-		conns:   make(map[uint32]*MuxConn),
-		ctx:     ctx,
-		cancel:  cancel,
+		conn:         conn,
+		pending:      make(map[uint32]chan connResult),
+		conns:        make(map[uint32]*MuxConn),
+		pingInterval: defaultPingInterval,
+		pongTimeout:  defaultPongTimeout,
+		pongCh:       make(chan struct{}, 1),
+		ctx:          ctx,
+		cancel:       cancel,
 	}
 	for _, opt := range opts {
 		opt(m)
 	}
 	go m.readLoop()
+	go m.pingLoop()
 	return m
 }
 
@@ -125,6 +152,37 @@ func (m *AgentMux) Close() error {
 	return m.conn.Close()
 }
 
+// declareDead fails every pending Dial and closes every established conn,
+// then stops the mux (closing the transport too) so subsequent Dials fail
+// fast. Called once the transport is known dead, whether readLoop's
+// ReadMessage errored or the ping health-check got no Pong in time.
+func (m *AgentMux) declareDead(reason error) {
+	m.pendingMu.Lock()
+	for _, ch := range m.pending {
+		select {
+		case ch <- connResult{err: reason}:
+		default:
+		}
+	}
+	m.pendingMu.Unlock()
+
+	// Propagate the transport's death to already-established conns too.
+	// Without this, a blocked Read has no way to learn its transport is
+	// gone and sits until the 1-minute per-conn hardcoded timeout.
+	m.connsMu.RLock()
+	conns := make([]*MuxConn, 0, len(m.conns))
+	for _, c := range m.conns {
+		conns = append(conns, c)
+	}
+	m.connsMu.RUnlock()
+	for _, c := range conns {
+		c.closeFromRemote()
+	}
+
+	m.cancel()
+	m.conn.Close()
+}
+
 // readLoop is the single goroutine that reads all messages from the agent.
 func (m *AgentMux) readLoop() {
 	for {
@@ -144,15 +202,13 @@ func (m *AgentMux) readLoop() {
 					logger.Error("Error reading from agent", "error", err)
 				}
 			}
-			// Fail all pending dials
-			m.pendingMu.Lock()
-			for _, ch := range m.pending {
-				select {
-				case ch <- connResult{err: fmt.Errorf("agent connection closed")}:
-				default:
-				}
+			select {
+			case <-m.ctx.Done():
+				// Close() already ran declareDead-equivalent teardown via cancel;
+				// nothing further to do.
+			default:
+				m.declareDead(fmt.Errorf("agent connection closed"))
 			}
-			m.pendingMu.Unlock()
 			return
 		}
 
@@ -168,9 +224,72 @@ func (m *AgentMux) readLoop() {
 		case protocol.MsgLog:
 			m.handleLog(msg)
 		case protocol.MsgPong:
-			// Ignore pong
+			select {
+			case m.pongCh <- struct{}{}:
+			default:
+			}
 		default:
 			logger.Warn("Unknown message type", "type", msg.Type)
+		}
+	}
+}
+
+// pingLoop actively checks the transport is still answering, independent of
+// whatever logical conns happen to be carrying traffic. This catches the
+// case a passive read error never surfaces: the vsock conn stays open but
+// the agent (or the network under it) stops responding, so ReadMessage
+// blocks indefinitely on empty legitimate silence and existing MuxConns'
+// keepalive-style traffic on unrelated conns can mask the problem.
+func (m *AgentMux) pingLoop() {
+	ticker := time.NewTicker(m.pingInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		// Drain any pong left over from a previous cycle (e.g. one that
+		// arrived just after that cycle's timeout fired) so it can't be
+		// mistaken for an answer to the ping about to be sent.
+		select {
+		case <-m.pongCh:
+		default:
+		}
+
+		m.writeMu.Lock()
+		err := protocol.WriteMessage(m.conn, &protocol.Message{Type: protocol.MsgPing})
+		m.writeMu.Unlock()
+		if err != nil {
+			// A failed write is evidence of death on its own - a wedged
+			// transport can otherwise keep readLoop's ReadMessage blocked
+			// forever with no read error to observe, so waiting for readLoop
+			// to notice would leave the mux unmonitored indefinitely.
+			select {
+			case <-m.ctx.Done():
+			default:
+				logger.Error("Agent mux ping write failed, declaring transport dead", "error", err)
+				m.declareDead(fmt.Errorf("agent mux ping write failed: %w", err))
+			}
+			return
+		}
+
+		select {
+		case <-m.ctx.Done():
+			return
+		case <-m.pongCh:
+			// Alive; wait for the next tick.
+		case <-time.After(m.pongTimeout):
+			select {
+			case <-m.ctx.Done():
+				// Already torn down by another path.
+			default:
+				logger.Error("Agent mux ping timeout, declaring transport dead", "timeout", m.pongTimeout)
+				m.declareDead(fmt.Errorf("agent mux ping timeout after %v", m.pongTimeout))
+			}
+			return
 		}
 	}
 }

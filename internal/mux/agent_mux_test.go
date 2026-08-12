@@ -6,6 +6,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -554,6 +555,164 @@ func TestAgentMux_DataDelivery_NoDropWhenBufferFull(t *testing.T) {
 	}
 
 	<-sendDone
+}
+
+// TestAgentMux_ReadLoopDeath_PropagatesToEstablishedConns is a regression
+// test: when readLoop exits (e.g. the underlying vsock conn breaks), it used
+// to only fail pending Dials, leaving already-established MuxConns with no
+// signal that their transport died. Their blocked Read would sit for the
+// full hardcoded 1-minute timeout instead of failing promptly.
+func TestAgentMux_ReadLoopDeath_PropagatesToEstablishedConns(t *testing.T) {
+	agentSide, muxSide := net.Pipe()
+	defer muxSide.Close()
+
+	mux := NewAgentMux(muxSide)
+	defer mux.Close()
+
+	go mockAgent(t, agentSide)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := mux.Dial(ctx, "tcp", "example.com:443")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Break the transport out from under the mux, simulating the vsock conn
+	// dying. readLoop's next ReadMessage call returns an error and exits.
+	agentSide.Close()
+
+	readErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		_, err := conn.Read(buf)
+		readErrCh <- err
+	}()
+
+	select {
+	case err := <-readErrCh:
+		require.Error(t, err, "conn.Read should fail once the mux's transport dies")
+	case <-time.After(5 * time.Second):
+		t.Fatal("conn.Read did not return promptly after readLoop died - it will hang until the 1-minute timeout")
+	}
+}
+
+// TestAgentMux_PingTimeout_DeclaresMuxDead is a regression test for the
+// "vsock open but wedged" case: the underlying conn never returns a read
+// error (so readLoop keeps running and RTT/keepalive-style traffic on other
+// logical conns can keep flowing), yet the agent has stopped responding.
+// Without an active health check, established conns would have no way to
+// detect this and would sit until their own 1-minute per-conn timeout.
+func TestAgentMux_PingTimeout_DeclaresMuxDead(t *testing.T) {
+	agentSide, muxSide := net.Pipe()
+	defer agentSide.Close()
+	defer muxSide.Close()
+
+	mux := NewAgentMux(muxSide, withPingInterval(50*time.Millisecond), withPongTimeout(200*time.Millisecond))
+	defer mux.Close()
+
+	// Agent that acks connects but never answers Ping - simulating a wedged
+	// agent side (vsock conn itself stays open).
+	go func() {
+		for {
+			msg, err := protocol.ReadMessage(agentSide)
+			if err != nil {
+				return
+			}
+			if msg.Type == protocol.MsgConnectDirect {
+				ack := &protocol.Message{Type: protocol.MsgConnectAck, ConnID: msg.ConnID}
+				if err := protocol.WriteMessage(agentSide, ack); err != nil {
+					return
+				}
+			}
+			// MsgPing intentionally ignored: no MsgPong sent back.
+		}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := mux.Dial(ctx, "tcp", "example.com:443")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	readErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		_, err := conn.Read(buf)
+		readErrCh <- err
+	}()
+
+	select {
+	case err := <-readErrCh:
+		require.Error(t, err, "conn.Read should fail once ping health-check declares the mux dead")
+	case <-time.After(3 * time.Second):
+		t.Fatal("conn.Read did not return after ping timeout - mux health check did not fire")
+	}
+
+	// A dead mux must also reject new Dials immediately.
+	dialCtx, dialCancel := context.WithTimeout(context.Background(), 1*time.Second)
+	defer dialCancel()
+	_, err = mux.Dial(dialCtx, "tcp", "other.example.com:443")
+	assert.Error(t, err)
+}
+
+// failWriteConn wraps a net.Conn and fails every Write once armed, while
+// still allowing Close/Read through to the underlying conn.
+type failWriteConn struct {
+	net.Conn
+	armed atomic.Bool
+}
+
+func (c *failWriteConn) Write(b []byte) (int, error) {
+	if c.armed.Load() {
+		return 0, fmt.Errorf("simulated write failure")
+	}
+	return c.Conn.Write(b)
+}
+
+// TestAgentMux_PingWriteError_StillDeclaresMuxDead is a regression test: a
+// single failed Ping write used to just `return` from pingLoop, permanently
+// disabling the health check for the rest of the process even though
+// readLoop's blocking ReadMessage may never itself return (a wedged
+// transport can keep accepting reads with no data forever). A write error
+// on the ping is evidence of death on its own and must tear the mux down,
+// not merely give up monitoring.
+func TestAgentMux_PingWriteError_StillDeclaresMuxDead(t *testing.T) {
+	agentSide, muxSide := net.Pipe()
+	defer agentSide.Close()
+
+	wrapped := &failWriteConn{Conn: muxSide}
+
+	mux := NewAgentMux(wrapped, withPingInterval(50*time.Millisecond), withPongTimeout(200*time.Millisecond))
+	defer mux.Close()
+
+	go mockAgent(t, agentSide)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	conn, err := mux.Dial(ctx, "tcp", "example.com:443")
+	require.NoError(t, err)
+	defer conn.Close()
+
+	// Arm the write failure only after the conn is established, so the
+	// failure hits a ping write, not the Dial's ConnectDirect write.
+	wrapped.armed.Store(true)
+
+	readErrCh := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 16)
+		_, err := conn.Read(buf)
+		readErrCh <- err
+	}()
+
+	select {
+	case err := <-readErrCh:
+		require.Error(t, err, "conn.Read should fail once a ping write error declares the mux dead")
+	case <-time.After(3 * time.Second):
+		t.Fatal("conn.Read did not return after ping write failure - pingLoop stopped monitoring instead of declaring the mux dead")
+	}
 }
 
 func TestAgentMux_SendShutdown(t *testing.T) {
