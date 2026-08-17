@@ -1012,6 +1012,13 @@ func (b *Backend) State() State {
 	return b.getState()
 }
 
+// Ready reports whether the backend currently has an active tunnel. It is
+// false during initial connect and while reconnecting after a drop, distinct
+// from whether initialization has ever completed once.
+func (b *Backend) Ready() bool {
+	return b.getState() == StateActive
+}
+
 // UpdateInstanceID updates the instance ID (used for lazy initialization when instance is resolved later)
 func (b *Backend) UpdateInstanceID(instanceID string) {
 	b.config.InstanceID = instanceID

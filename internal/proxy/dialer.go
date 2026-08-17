@@ -23,6 +23,14 @@ type UpstreamProxyChecker interface {
 	UsesUpstreamProxy(address string) bool
 }
 
+// readyReporter is optionally implemented by backends that track connection
+// state beyond the one-time init latch, e.g. a backend that reconnects after
+// a dropped tunnel. isInitialized only ever transitions from false to true,
+// so it cannot detect a since-lost connection; Ready() can.
+type readyReporter interface {
+	Ready() bool
+}
+
 // ProxyDialer handles connection routing, lazy initialization, and fallback logic.
 // It is shared between SOCKS5 and HTTP CONNECT proxy servers.
 type ProxyDialer struct {
@@ -104,6 +112,14 @@ func (d *ProxyDialer) isInitialized() bool {
 	}
 }
 
+// backendReady reports whether the current backend has an active tunnel.
+// Backends that don't track this (e.g. test dialers) are treated as always
+// ready, matching pre-existing behavior.
+func (d *ProxyDialer) backendReady() bool {
+	rr, ok := d.GetDialer().(readyReporter)
+	return !ok || rr.Ready()
+}
+
 // Dial is the unified dial function for all route types
 func (d *ProxyDialer) Dial(ctx context.Context, network, addr string) (net.Conn, error) {
 	host, port, err := net.SplitHostPort(addr)
@@ -155,30 +171,41 @@ func (d *ProxyDialer) Dial(ctx context.Context, network, addr string) (net.Conn,
 	}
 
 	// RouteProxy: check if lazy initialization is needed
-	if d.lazyInitializer != nil && !d.isInitialized() {
+	notInitialized := d.lazyInitializer != nil && !d.isInitialized()
+	if notInitialized || !d.backendReady() {
 		// Hosts with a pre-connect override skip the wait entirely and use
-		// the override route until the backend finishes connecting.
+		// the override route until the backend is active, whether that's the
+		// first connect or a reconnect after a dropped tunnel.
 		if d.router != nil {
 			if preRoute := d.router.RoutePreConnect(host); preRoute != "" {
-				go d.lazyInitializer.EnsureInitialized(context.Background())
-				dialerLogger.Info("Backend not ready, using pre-connect route", "address", addr, "route", preRoute)
+				if notInitialized {
+					go d.lazyInitializer.EnsureInitialized(context.Background())
+				}
+				dialerLogger.Info("Backend not active, using pre-connect route", "address", addr, "route", preRoute)
 				return d.dialWithRoute(ctx, network, addr, preRoute)
 			}
 		}
 
-		// Start initialization in background (non-blocking)
-		go d.lazyInitializer.EnsureInitialized(context.Background())
+		// Without a pre-connect override, only the not-yet-initialized case
+		// waits here. A backend that initialized once and is now mid-reconnect
+		// has its own reconnect loop already running; fall through and let
+		// dialProxy surface the current error rather than waiting on a state
+		// with no dedicated completion signal.
+		if notInitialized {
+			// Start initialization in background (non-blocking)
+			go d.lazyInitializer.EnsureInitialized(context.Background())
 
-		// Hold proxy connections until initialization completes
-		dialerLogger.Info("Waiting for initialization to complete", "address", addr)
-		select {
-		case <-ctx.Done():
-			return nil, ctx.Err()
-		case <-d.lazyInitializer.InitDone():
-			if err := d.lazyInitializer.InitError(); err != nil {
-				return nil, fmt.Errorf("initialization failed: %w", err)
+			// Hold proxy connections until initialization completes
+			dialerLogger.Info("Waiting for initialization to complete", "address", addr)
+			select {
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			case <-d.lazyInitializer.InitDone():
+				if err := d.lazyInitializer.InitError(); err != nil {
+					return nil, fmt.Errorf("initialization failed: %w", err)
+				}
+				dialerLogger.Info("Initialization complete, dialing via proxy", "address", addr)
 			}
-			dialerLogger.Info("Initialization complete, dialing via proxy", "address", addr)
 		}
 	}
 

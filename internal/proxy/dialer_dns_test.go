@@ -346,3 +346,57 @@ type stubLazyInitializer struct {
 func (s *stubLazyInitializer) EnsureInitialized(ctx context.Context) error { return nil }
 func (s *stubLazyInitializer) InitDone() <-chan struct{}                   { return s.done }
 func (s *stubLazyInitializer) InitError() error                            { return nil }
+
+// notReadyDialer wraps recordingDialer and reports itself as not Ready,
+// simulating a backend that initialized once but is now mid-reconnect after
+// a dropped tunnel.
+type notReadyDialer struct {
+	recordingDialer
+}
+
+func (n *notReadyDialer) Ready() bool { return false }
+
+func TestDialPreConnectRouteAppliesDuringReconnect(t *testing.T) {
+	router := routing.NewRouter(&routing.Config{
+		Default:          "proxy",
+		PreConnectDirect: []string{"auth.example.com"},
+	})
+	d := NewProxyDialer(router, nil)
+
+	// Initialization already completed once...
+	init := &stubLazyInitializer{done: make(chan struct{})}
+	close(init.done)
+	d.SetLazyInitializer(init)
+
+	// ...but the backend has since dropped its tunnel and is reconnecting.
+	backend := &notReadyDialer{}
+	d.SetBackendDialer(backend)
+
+	_, err := d.Dial(context.Background(), "tcp", "auth.example.com:443")
+
+	// The pre-connect override dials directly by name (no DNS mock here, so
+	// this fails), never through the backend.
+	require.Error(t, err)
+	assert.Empty(t, backend.dialed())
+}
+
+func TestDialWaitsWhenBackendNotReadyWithoutPreConnect(t *testing.T) {
+	router := routing.NewRouter(&routing.Config{Default: "proxy"})
+	d := NewProxyDialer(router, nil)
+
+	init := &stubLazyInitializer{done: make(chan struct{})}
+	close(init.done)
+	d.SetLazyInitializer(init)
+
+	backend := &notReadyDialer{}
+	d.SetBackendDialer(backend)
+
+	conn, err := d.Dial(context.Background(), "tcp", "other.example.com:443")
+	require.NoError(t, err)
+	conn.Close()
+
+	// No pre-connect override applies, so the dial still falls through to
+	// the backend even though it reports not ready: the backend's own
+	// reconnect loop owns retries, and dialProxy surfaces its current error.
+	assert.Equal(t, []string{"other.example.com:443"}, backend.dialed())
+}
