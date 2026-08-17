@@ -164,6 +164,15 @@ func (s *HTTPProxyServer) handleForward(conn net.Conn, req *http.Request) {
 	// Remove hop-by-hop headers
 	removeHopByHopHeaders(req.Header)
 
+	// handleConn reads exactly one request per accepted connection, so this
+	// proxy can never honor a kept-alive upstream connection. Ask upstream
+	// to close so the response side doesn't linger past the body waiting
+	// for an idle timeout (the raw byte relay below can't rewrite whatever
+	// Connection header upstream sends back to the client, so a compliant
+	// upstream closing promptly is what actually bounds the wait -- the
+	// discard-watcher below covers the case where it doesn't).
+	req.Close = true
+
 	// Forward the request
 	if err := req.Write(targetConn); err != nil {
 		httpProxyLogger.Warn("HTTP forward write failed", "address", addr, "error", err)
@@ -173,7 +182,13 @@ func (s *HTTPProxyServer) handleForward(conn net.Conn, req *http.Request) {
 
 	// Copy the response back. Watch the client side too, so an ESC/abort on
 	// the client promptly closes targetConn instead of leaking the SSH
-	// channel until the (possibly stalled) upstream sends a byte.
+	// channel until the (possibly stalled) upstream sends a byte. By the
+	// time req.Write returned above, the client's request (headers and
+	// body) has already been fully consumed from conn, so any further byte
+	// from the client is a pipelined next request this handler will never
+	// forward -- treat it the same as a disconnect and close, rather than
+	// silently discarding it and leaving the client to wait on a response
+	// that will never come.
 	done := make(chan struct{}, 2)
 
 	go func() {
@@ -182,7 +197,8 @@ func (s *HTTPProxyServer) handleForward(conn net.Conn, req *http.Request) {
 	}()
 
 	go func() {
-		io.Copy(io.Discard, conn)
+		var buf [1]byte
+		conn.Read(buf[:])
 		done <- struct{}{}
 	}()
 

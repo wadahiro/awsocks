@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"os"
 	"testing"
 	"time"
 
@@ -136,6 +137,145 @@ func TestHTTPProxyServer_ForwardGET(t *testing.T) {
 	body, err := io.ReadAll(resp.Body)
 	require.NoError(t, err)
 	assert.Equal(t, `{"ok": true}`, string(body))
+
+	server.Stop()
+}
+
+func TestHTTPProxyServer_ForwardGET_RequestsUpstreamClose(t *testing.T) {
+	// handleConn reads exactly one request per accepted connection, so it
+	// can never honor a kept-alive upstream connection. The proxy must ask
+	// upstream to close regardless of what the client requested, since a
+	// verbatim keep-alive promise back to the client would invite a
+	// pipelined second request the proxy will never forward.
+	targetListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer targetListener.Close()
+
+	var forwardedConnectionHeader string
+	go func() {
+		conn, err := targetListener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		br := bufio.NewReader(conn)
+		req, err := http.ReadRequest(br)
+		if err != nil {
+			return
+		}
+		forwardedConnectionHeader = req.Header.Get("Connection")
+
+		body := `{"ok": true}`
+		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s", len(body), body)
+	}()
+	targetAddr := targetListener.Addr().String()
+
+	router := &mockRouter{route: routing.RouteDirect}
+	cfg := &Config{
+		HTTPListenAddr: "127.0.0.1:0",
+	}
+	server := NewHTTPProxyServer(cfg, router, nil)
+
+	go server.Start()
+	time.Sleep(100 * time.Millisecond)
+
+	server.listenerMu.Lock()
+	listener := server.listener
+	server.listenerMu.Unlock()
+	require.NotNil(t, listener)
+	proxyAddr := listener.Addr().String()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "GET http://%s/api/data HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddr, targetAddr)
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	assert.Equal(t, http.StatusOK, resp.StatusCode)
+
+	body, err := io.ReadAll(resp.Body)
+	require.NoError(t, err)
+	assert.Equal(t, `{"ok": true}`, string(body))
+
+	// The proxy must not ask upstream to keep the connection alive, since it
+	// never reads a second request off the same client conn.
+	assert.Equal(t, "close", forwardedConnectionHeader)
+
+	server.Stop()
+}
+
+func TestHTTPProxyServer_ForwardGET_PipelinedSecondRequestClosesPromptly(t *testing.T) {
+	// A client that (mis)trusts a keep-alive-looking response and pipelines
+	// a second request onto the same conn must see the connection close
+	// promptly, not hang until some faraway idle timeout. Before the fix,
+	// the second request's bytes were silently discarded and the client
+	// would wait indefinitely for a response that never comes.
+	targetListener, err := net.Listen("tcp", "127.0.0.1:0")
+	require.NoError(t, err)
+	defer targetListener.Close()
+
+	targetDone := make(chan struct{})
+	go func() {
+		defer close(targetDone)
+		conn, err := targetListener.Accept()
+		if err != nil {
+			return
+		}
+		defer conn.Close()
+		br := bufio.NewReader(conn)
+		if _, err := http.ReadRequest(br); err != nil {
+			return
+		}
+		body := `{"ok": true}`
+		fmt.Fprintf(conn, "HTTP/1.1 200 OK\r\nContent-Length: %d\r\nConnection: keep-alive\r\n\r\n%s", len(body), body)
+		// A real keep-alive upstream keeps the connection open waiting for a
+		// second request instead of closing right away. Hold it open past
+		// the test's own timeout so the fix under test -- not an incidental
+		// upstream close -- is what has to make the client conn close.
+		time.Sleep(3 * time.Second)
+	}()
+	targetAddr := targetListener.Addr().String()
+
+	router := &mockRouter{route: routing.RouteDirect}
+	cfg := &Config{
+		HTTPListenAddr: "127.0.0.1:0",
+	}
+	server := NewHTTPProxyServer(cfg, router, nil)
+
+	go server.Start()
+	time.Sleep(100 * time.Millisecond)
+
+	server.listenerMu.Lock()
+	listener := server.listener
+	server.listenerMu.Unlock()
+	require.NotNil(t, listener)
+	proxyAddr := listener.Addr().String()
+
+	conn, err := net.DialTimeout("tcp", proxyAddr, time.Second)
+	require.NoError(t, err)
+	defer conn.Close()
+
+	fmt.Fprintf(conn, "GET http://%s/api/data HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddr, targetAddr)
+
+	br := bufio.NewReader(conn)
+	resp, err := http.ReadResponse(br, nil)
+	require.NoError(t, err)
+	_, err = io.ReadAll(resp.Body)
+	require.NoError(t, err)
+
+	// Pipeline a second request right away, as a keep-alive-trusting client
+	// would.
+	fmt.Fprintf(conn, "GET http://%s/api/data2 HTTP/1.1\r\nHost: %s\r\n\r\n", targetAddr, targetAddr)
+
+	conn.SetReadDeadline(time.Now().Add(2 * time.Second))
+	_, err = br.ReadByte()
+	require.Error(t, err, "proxy should close promptly instead of silently discarding the pipelined request")
+	assert.NotErrorIs(t, err, os.ErrDeadlineExceeded, "proxy left the client waiting until the read deadline instead of closing")
+
+	<-targetDone
 
 	server.Stop()
 }
